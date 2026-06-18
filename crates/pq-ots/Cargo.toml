@@ -10,7 +10,7 @@ opentimestamps = "0.2"
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
-ureq = { version = "2", optional = true }
+ureq = { version = "3", optional = true }
 
 [features]
 default = []

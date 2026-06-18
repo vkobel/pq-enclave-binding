@@ -22,8 +22,8 @@ use nsm_nitro_enclave_utils::time::Time;
 use nsm_nitro_enclave_utils::verify::AttestationDocVerifierExt;
 use pq_bundle::{QuoteData, QuoteVerifier};
 use sha2::{Digest, Sha256};
-// Pinned (=0.2.4) only to keep nsm-nitro-enclave-utils' x509-cert `builder`
-// feature resolvable; not used directly.
+// Transitive of nsm-nitro-enclave-utils; referenced to keep it an explicit,
+// auditable part of the dependency set. Not used directly.
 use x509_cert as _;
 
 /// Verifies AWS Nitro NSM attestation documents against a pinned root CA, as of

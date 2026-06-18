@@ -10,7 +10,7 @@
 #   docker inspect stagex/pallet-rust --format '{{index .RepoDigests 0}}'
 # then replace the placeholder digest below.
 
-FROM --platform=linux/amd64 stagex/pallet-rust@sha256:REPLACE_WITH_VERIFIED_PALLET_RUST_DIGEST AS build
+FROM --platform=linux/amd64 stagex/pallet-rust@sha256:59d4d0c9e232a05ecb99348f7216b521af1b914a430059dbdb9130018f2afde1 AS build
 
 WORKDIR /app
 

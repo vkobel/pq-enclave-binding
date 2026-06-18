@@ -109,8 +109,12 @@ pinned root CA's SHA-256 against the bundle's archived `aws_root_ca_sha256`.
   hard-require a prerelease `signature` crate that cannot coexist in one lockfile with
   the mature `x509-cert`/`nsm-nitro-enclave-utils` COSE stack the verifier needs.
   `fips204`/`fips205` pull no `signature` crate and are `no_std`.
-- **`x509-cert` is pinned to `=0.2.4`** because `nsm-nitro-enclave-utils 0.1.x` needs
-  its `builder` feature, removed in 0.2.5.
+- **`x509-cert` is capped at `0.2`** (transitive of `nsm-nitro-enclave-utils`). 0.3
+  is still a prerelease (`0.3.0-rc`). The old hard `=0.2.4` pin was dropped once
+  `nsm-nitro-enclave-utils 0.1.3` removed its `builder`-feature requirement.
+- **`sha2` stays on `0.10`** (not 0.11): the RustCrypto `digest` 0.11 trait break
+  hasn't propagated to `fips204`/`fips205` or the COSE/x509 stack, so bumping alone
+  would fork `digest`.
 - `pqcrypto-mldsa` / `pqcrypto-dilithium` are deprecated (RUSTSEC) — do not introduce them.
 
 ## Deployment (Caution)

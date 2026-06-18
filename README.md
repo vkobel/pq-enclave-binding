@@ -109,14 +109,26 @@ The ceremony runs as a Caution enclave app. Two files at the repo root drive it:
 ### 1. Prerequisites
 
 - Add the **AWS Nitro root CA** (DER) to the repo root as `aws_nitro_root.der`.
-  It is baked into the image and its SHA-256 archived into every bundle. Download
-  it from AWS's attestation docs and commit it (it is a public cert).
-- Pin the StageX digest in `Containerfile`. Replace
-  `REPLACE_WITH_VERIFIED_PALLET_RUST_DIGEST`:
+  It is baked into the image and its SHA-256 is archived into every bundle, so the
+  *same* file must be used at verification time (`pq verify --root`). It is a
+  public cert — commit it. AWS publishes the long-lived **Root-G1** certificate as
+  a PEM in a zip; verify its SHA-256 against AWS's
+  [verify-the-root-of-trust](https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html)
+  page, then convert PEM → DER:
 
   ```bash
-  docker pull stagex/pallet-rust --platform linux/amd64
-  docker inspect stagex/pallet-rust --format '{{index .RepoDigests 0}}'
+  curl -sO https://aws-nitro-enclaves.amazonaws.com/AWS_NitroEnclaves_Root-G1.zip
+  unzip -o AWS_NitroEnclaves_Root-G1.zip          # -> root.pem
+  sha256sum root.pem                              # compare against the AWS docs page
+  openssl x509 -in root.pem -outform der -out aws_nitro_root.der
+  ```
+- The `Containerfile` pins the `stagex/pallet-rust` image by digest. It is set to
+  a verified value from StageX's published digests; refresh it when you move to a
+  newer StageX release and confirm it against the authoritative list:
+
+  ```bash
+  curl -s https://codeberg.org/stagex/stagex/raw/branch/main/digests/pallet.txt \
+    | awk '$2 == "pallet-rust" { print $1 }'
   ```
 
 - Set a real `domain` (and `app_sources`) in `Procfile`.

@@ -24,16 +24,14 @@ impl HttpCalendar {
 impl CalendarClient for HttpCalendar {
     fn submit(&self, digest: &[u8]) -> Result<Vec<u8>, String> {
         let url = format!("{}/digest", self.base_url);
-        let resp = ureq::post(&url)
-            .set("Accept", "application/vnd.opentimestamps.v1")
-            .set("Content-Type", "application/x-www-form-urlencoded")
-            .send_bytes(digest)
-            .map_err(|e| format!("POST {url}: {e}"))?;
-        let mut body = Vec::new();
-        resp.into_reader()
-            .read_to_end(&mut body)
-            .map_err(|e| format!("reading calendar response: {e}"))?;
-        Ok(body)
+        ureq::post(&url)
+            .header("Accept", "application/vnd.opentimestamps.v1")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .send(digest)
+            .map_err(|e| format!("POST {url}: {e}"))?
+            .into_body()
+            .read_to_vec()
+            .map_err(|e| format!("reading calendar response: {e}"))
     }
 }
 
@@ -60,7 +58,8 @@ impl BitcoinHeaderSource for EsploraHeaderSource {
         let block_hash = ureq::get(&hash_url)
             .call()
             .map_err(|e| format!("GET {hash_url}: {e}"))?
-            .into_string()
+            .into_body()
+            .read_to_string()
             .map_err(|e| format!("reading block hash: {e}"))?;
         let block_hash = block_hash.trim();
 
@@ -69,7 +68,8 @@ impl BitcoinHeaderSource for EsploraHeaderSource {
         let body = ureq::get(&block_url)
             .call()
             .map_err(|e| format!("GET {block_url}: {e}"))?
-            .into_string()
+            .into_body()
+            .read_to_string()
             .map_err(|e| format!("reading block: {e}"))?;
 
         // crude extraction of the "merkle_root":"<hex>" field to avoid a JSON dep
@@ -96,5 +96,3 @@ impl BitcoinHeaderSource for EsploraHeaderSource {
         Ok(root)
     }
 }
-
-use std::io::Read as _;
