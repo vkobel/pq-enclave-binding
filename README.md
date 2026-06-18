@@ -10,7 +10,98 @@ The artifact is a small JSON **bundle** proving:
 
 It is a one-time key **burn-in ceremony**, not a live attestation service.
 
-## Why
+---
+
+## Demo: the full loop, end to end
+
+This walks the whole lifecycle — **ceremony → fetch → stamp → verify** — and
+shows what each step prints. Steps 1–3 run locally with a mock NSM (no hardware);
+the cryptographically-real version of the same loop requires a Nitro deployment
+(see [Deploy on Caution](#deploy-on-caution)).
+
+### 0. Build & smoke-test
+
+```bash
+cargo build --workspace
+cargo test  --workspace      # all crates use mocks; no network/hardware needed
+```
+
+### 1. Run the ceremony and fetch the bundle (local mock)
+
+```bash
+bash demo/run_demo.sh
+```
+
+This builds `pq-ceremony` with `MockNsm`, runs the one-shot burn-in, serves the
+bundle over HTTP, fetches it, and inspects it:
+
+```
+==> building pq-ceremony (mock NSM) and pq CLI
+==> starting ceremony on 127.0.0.1:18099
+==> waiting for the ceremony to finish key generation
+==> fetching /bundle.json from the (mock) enclave
+==> pq inspect
+bundle version:      1
+ml-dsa-65 pk:        1952 bytes
+slh-dsa-128f pk:     32 bytes
+nsm quote:           ... bytes (COSE_Sign1)
+aws root ca sha256:  <sha256 of the baked-in root CA>
+expected PCR0:       <48-byte hex>
+expected PCR1:       <48-byte hex>
+expected PCR2:       <48-byte hex>
+digest (sha256):     <sha256 of the canonical bundle JSON>
+
+Local demo OK. The bundle is real in shape but mock in attestation.
+Deploy to Caution for a genuine NSM quote, then: pq stamp / pq verify.
+```
+
+The bundle is **structurally** valid but **mock-attested**: the quote is a fake
+COSE doc and the PCRs are placeholders, so `pq verify` will *not* pass on it. The
+mock loop exercises everything that doesn't need real silicon — keygen,
+dual-signing, bundle assembly, HTTP serving, and `pq inspect`.
+
+### 2. Timestamp the bundle
+
+```bash
+pq stamp --bundle bundle.json --out bundle.json.ots
+```
+
+```
+✓ stamped via https://alice.btc.calendar.opentimestamps.org; wrote bundle.json.ots (... bytes)
+  upgrade the proof in ~a few hours once anchored in Bitcoin
+```
+
+`stamp` submits `SHA-256(bundle.json)` to OpenTimestamps calendars and writes a
+proof. After ~a few hours the digest is anchored in a Bitcoin block; upgrade the
+`.ots` then.
+
+### 3. Verify (only passes on a *real* bundle)
+
+```bash
+pq verify \
+  --bundle  bundle.json \
+  --ots     bundle.json.ots \
+  --root    aws_nitro_root.der \
+  --esplora https://blockstream.info/api \
+  --quote-time-unix <anchor-block-time>
+```
+
+```
+✓ OTS: bundle anchored in Bitcoin block 800123
+✓ NSM quote verified against pinned AWS root (as of unix 1700000000)
+✓ PCR0/1/2 pinning, debug-mode rejection, key binding, dual PQ signatures
+
+VERIFIED: these PQ keys were generated in the attested enclave before Bitcoin block 800123
+```
+
+`pq verify` is **fully offline** — it reads only the four inputs above and makes
+no call to the enclave. It checks the quote *embedded in the bundle*, not a live
+endpoint. (To check the **live** enclave's attestation, use `caution verify` —
+see [Deploy on Caution](#deploy-on-caution).)
+
+---
+
+## How it works
 
 A Nitro attestation quote is signed with AWS's **ECDSA P-384** PKI — classical
 crypto that a quantum computer breaks. So a quote alone is worthless after Q-Day.
@@ -24,10 +115,6 @@ This design chains three independently-sound primitives so the proof survives:
    pre-Q-Day, when the ECDSA was still sound.
 3. **Dual PQ self-signatures** (lattice **and** hash-based) prove possession of
    the private keys and hedge a future break of either family.
-
-See [`demo-spec.md`](demo-spec.md) for the full cryptographic soundness analysis.
-
-## How it works
 
 ```
 [Nitro Enclave: pq-ceremony]            (one shot, on startup)
@@ -47,7 +134,16 @@ See [`demo-spec.md`](demo-spec.md) for the full cryptographic soundness analysis
                 + debug-mode rejection + key binding + dual PQ signature
 ```
 
-## Workspace layout
+`verify` enforces these checks and fails on the first miss: OTS Bitcoin anchor →
+NSM ES384 signature chains to the **pinned** root → **debug-mode rejection**
+(PCR0/1/2 not all-zero) → **PCR pinning** (quote PCRs == `expected_pcrs`) → key
+binding (`user_data` == commitment) → both PQ signatures. The Nitro chain is
+checked **as of the OTS anchor block time**, when AWS's cert was valid and its
+ECDSA sound — that is the whole point of the timestamp.
+
+See [`demo-spec.md`](demo-spec.md) for the full cryptographic soundness analysis.
+
+### Workspace layout
 
 | Crate | Role |
 |-------|------|
@@ -59,46 +155,7 @@ See [`demo-spec.md`](demo-spec.md) for the full cryptographic soundness analysis
 | `pq-ots` | OpenTimestamps stamping + Bitcoin-anchored proof verification |
 | `pq-cli` | `pq` binary: host-side `inspect` / `verify` / `stamp` |
 
-## Build & test
-
-```bash
-cargo build --workspace
-cargo test  --workspace
-bash demo/run_demo.sh     # local loop with MockNsm (no hardware needed)
-```
-
-The local demo produces a structurally valid but **mock-attested** bundle — fine
-for exercising the plumbing, but `pq verify` only passes on a bundle from a real
-enclave.
-
-## Using the `pq` CLI
-
-```bash
-# Summarize a bundle (no verification).
-pq inspect --bundle bundle.json
-
-# Timestamp it: submit SHA-256(bundle.json) to OTS calendars, write a proof.
-pq stamp --bundle bundle.json --out bundle.json.ots
-#   wait ~a few hours, then upgrade the .ots once anchored in a Bitcoin block.
-
-# Full verification — ALL checks must pass.
-pq verify \
-  --bundle  bundle.json \
-  --ots     bundle.json.ots \
-  --root    aws_nitro_root.der \           # pinned out-of-band; cross-checked vs bundle
-  --headers headers.json                   # { "<height>": { "merkle_root": "<hex>", "time": <unix> } }
-# or, instead of --headers, hit a live explorer:
-#   --esplora https://blockstream.info/api --quote-time-unix <secs>
-```
-
-`verify` enforces, and fails on the first miss: OTS Bitcoin anchor → NSM ES384
-signature chains to the **pinned** root → **debug-mode rejection** (PCR0/1/2 not
-all-zero) → **PCR pinning** (quote PCRs == `expected_pcrs`) → key binding
-(`user_data` == commitment) → both PQ signatures. The Nitro chain is checked **as
-of the OTS anchor block time**, when AWS's cert was valid and its ECDSA sound.
-
-`merkle_root` in the header file is **internal byte order** — reverse the
-big-endian hex that explorers display.
+---
 
 ## Deploy on Caution
 
@@ -165,11 +222,15 @@ pq stamp --bundle bundle.json --out bundle.json.ots
 
 ### 5. Verify the deployment and the bundle
 
+Two independent checks. The first checks the **live** enclave; the second checks
+the **artifact**.
+
 ```bash
-# Reproduce the enclave build and compare PCRs against the live attestation.
+# (a) Live attestation: reproduce the enclave build and compare PCRs against the
+#     running enclave's attestation. This is the ONLY step that hits the enclave.
 caution verify --attestation-url https://<your-domain>/attestation
 
-# Then verify the bundle itself (after the .ots is anchored, ~hours later).
+# (b) The bundle itself — fully offline (after the .ots is anchored, ~hours later).
 pq verify --bundle bundle.json --ots bundle.json.ots \
   --root aws_nitro_root.der --esplora https://blockstream.info/api \
   --quote-time-unix <anchor-block-time>
@@ -177,13 +238,43 @@ pq verify --bundle bundle.json --ots bundle.json.ots \
 
 `caution verify` independently re-derives the PCR0/1/2 that `pq verify` pins
 against, closing the loop: the reproducible build *is* the published
-`expected_pcrs`.
+`expected_pcrs`. `pq verify` then trusts only the quote bytes inside the bundle —
+it does not re-contact the enclave.
 
 > Do not deploy with `debug: true` — it zeroes the PCRs, which `pq verify`
 > rejects (debug-mode check) and `caution verify` cannot reproduce.
+
+---
+
+## `pq` CLI reference
+
+```bash
+# Summarize a bundle (no verification).
+pq inspect --bundle bundle.json
+
+# Timestamp it: submit SHA-256(bundle.json) to OTS calendars, write a proof.
+pq stamp --bundle bundle.json --out bundle.json.ots
+#   wait ~a few hours, then upgrade the .ots once anchored in a Bitcoin block.
+
+# Full verification — ALL checks must pass.
+pq verify \
+  --bundle  bundle.json \
+  --ots     bundle.json.ots \
+  --root    aws_nitro_root.der \           # pinned out-of-band; cross-checked vs bundle
+  --headers headers.json                   # { "<height>": { "merkle_root": "<hex>", "time": <unix> } }
+# or, instead of --headers, hit a live explorer:
+#   --esplora https://blockstream.info/api --quote-time-unix <secs>
+```
+
+`merkle_root` in the header file is **internal byte order** — reverse the
+big-endian hex that explorers display.
+
+---
 
 ## Status
 
 Pre-1.0. The PQ crates (`fips204`/`fips205`) are young and SLH-DSA-class
 implementations are unaudited — pin versions and track RUSTSEC. This proves a
 root-key burn-in; it is **not** a solution for live RA-TLS.
+</content>
+</invoke>
