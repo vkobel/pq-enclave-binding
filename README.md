@@ -145,6 +145,19 @@ the reproducible build *is* the measurement the bundle pins against.
 
 ### 6. Verify the *bundle* — `pq verify` (offline, durable)
 
+First find the **time of the Bitcoin block the proof is anchored in** — `pq verify`
+checks the Nitro certificate chain *as of that instant*, not now (see
+[Verification time](#verification-time-the-anchor-block-not-now) below for why).
+Two hops:
+
+```bash
+ots info bundle.json.ots                     # → "bitcoin block <height> attestation"
+hash=$(curl -s https://blockstream.info/api/block-height/<height>)
+curl -s https://blockstream.info/api/block/$hash | jq .timestamp   # → <anchor-block-time>
+```
+
+Then verify:
+
 ```console
 $ ./target/debug/pq verify \
     --bundle  bundle.json \
@@ -167,6 +180,41 @@ as of the OTS anchor block time, not a live endpoint.
 Get `aws_nitro_root.der` once, out of band (see
 [Prerequisites](#1-prerequisites)); `pq verify` cross-checks its SHA-256 against
 the `aws_root_ca_sha256` recorded in the bundle.
+
+#### Verification time: the anchor block, not now
+
+A Nitro leaf certificate lives only a few hours, and AWS signs it with
+quantum-breakable ECDSA P-384. So verifying the chain against the **current** clock
+is both broken (the cert expired long ago) and meaningless after Q-Day. `pq verify`
+instead checks the chain **as of the instant the bundle was timestamped into
+Bitcoin** — when the cert was valid and its signature still sound. That instant is
+`--quote-time-unix`, in Unix seconds.
+
+Set it to the **timestamp of the anchor block** (the two-hop recipe above). It need
+not be the exact block time — any instant inside the leaf cert's validity window
+works — but the block time is the principled, reproducible choice.
+
+Whether the flag is **required** depends on your Bitcoin header source:
+
+| Source | `--quote-time-unix` |
+|---|---|
+| `--esplora <url>` | **Required** — esplora can't supply the time to the check, so you must pass it. |
+| `--headers <file>` | **Optional** — if the anchor block's entry has a `"time"` field, it's used automatically; pass the flag only to override. |
+
+So the fully offline, self-contained form needs no flag — put the time in the
+header file instead:
+
+```json
+{ "<height>": { "merkle_root": "<internal-byte-order-hex>", "time": <anchor-block-time> } }
+```
+
+```bash
+pq verify --bundle bundle.json --ots bundle.json.ots \
+  --root aws_nitro_root.der --headers headers.json     # no --quote-time-unix needed
+```
+
+(`merkle_root` is **internal byte order** — reverse the big-endian hex explorers
+show.)
 
 ### The two checks are complementary
 
@@ -365,12 +413,21 @@ pq verify \
   --ots     bundle.json.ots \
   --root    aws_nitro_root.der \           # pinned out-of-band; cross-checked vs bundle
   --headers headers.json                   # { "<height>": { "merkle_root": "<hex>", "time": <unix> } }
-# or, instead of --headers, hit a live explorer:
-#   --esplora https://blockstream.info/api --quote-time-unix <secs>
+# or, instead of --headers, hit a live explorer (then --quote-time-unix is required):
+#   --esplora https://blockstream.info/api --quote-time-unix <anchor-block-time>
 ```
 
-`merkle_root` in the header file is **internal byte order** — reverse the
-big-endian hex that explorers display.
+Flags:
+- `--root` — the pinned AWS Nitro root CA (DER), fetched out of band; its SHA-256
+  is cross-checked against `aws_root_ca_sha256` in the bundle.
+- `--headers` **or** `--esplora` — the Bitcoin header source (mutually exclusive).
+  `merkle_root` in the header file is **internal byte order** — reverse the
+  big-endian hex explorers display.
+- `--quote-time-unix` — Unix-seconds instant to verify the Nitro cert chain as of;
+  use the **anchor block's timestamp**. **Required with `--esplora`**; with
+  `--headers` it defaults to the block's `"time"` field. See
+  [Verification time](#verification-time-the-anchor-block-not-now) for why and how
+  to obtain it.
 
 ---
 
@@ -379,5 +436,3 @@ big-endian hex that explorers display.
 Pre-1.0. The PQ crates (`fips204`/`fips205`) are young and SLH-DSA-class
 implementations are unaudited — pin versions and track RUSTSEC. This proves a
 root-key burn-in; it is **not** a solution for live RA-TLS.
-</content>
-</invoke>
