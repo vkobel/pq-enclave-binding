@@ -112,15 +112,18 @@ The ceremony runs as a Caution enclave app. Two files at the repo root drive it:
   It is baked into the image and its SHA-256 is archived into every bundle, so the
   *same* file must be used at verification time (`pq verify --root`). It is a
   public cert — commit it. AWS publishes the long-lived **Root-G1** certificate as
-  a PEM in a zip; verify its SHA-256 against AWS's
+  a PEM in a zip, and documents its **SHA-256 fingerprint** (the authoritative
+  check) on the
   [verify-the-root-of-trust](https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html)
-  page, then convert PEM → DER:
+  page. Download, convert PEM → DER, and confirm the fingerprint matches:
 
   ```bash
   curl -sO https://aws-nitro-enclaves.amazonaws.com/AWS_NitroEnclaves_Root-G1.zip
   unzip -o AWS_NitroEnclaves_Root-G1.zip          # -> root.pem
-  sha256sum root.pem                              # compare against the AWS docs page
   openssl x509 -in root.pem -outform der -out aws_nitro_root.der
+  # AWS-documented fingerprint (on the verify-root page) — must equal:
+  #   64:1A:03:21:A3:E2:44:EF:E4:56:46:31:95:D6:06:31:7E:D7:CD:CC:3C:17:56:E0:98:93:F3:C6:8F:79:BB:5B
+  openssl x509 -in aws_nitro_root.der -inform der -noout -fingerprint -sha256
   ```
 - The `Containerfile` pins the `stagex/pallet-rust` image by digest. It is set to
   a verified value from StageX's published digests; refresh it when you move to a
