@@ -121,13 +121,13 @@ pinned root CA's SHA-256 against the bundle's archived `aws_root_ca_sha256`.
 
 The ceremony deploys as a Caution Nitro enclave app. Root-level `Containerfile`
 (StageX reproducible Rust build, `--features nitro`, `FROM scratch`) and `Procfile`
-(`run: /app/pq-ceremony ...`, serves port 8080) drive it; `demo/run_demo.sh` runs
-the loop locally with `MockNsm`. See `README.md` for the full deploy steps. Two
-prerequisites are intentionally **not** in the repo and must be supplied:
-`aws_nitro_root.der` at the repo root (the Containerfile `COPY`s it), and a real
-pinned StageX digest replacing the placeholder in `Containerfile`. A real NSM quote
-needs production Nitro — QEMU has no NSM device, so the ceremony's attestation step
-only fully succeeds when deployed.
+(`run: /app/pq-ceremony --root-ca /etc/pq/aws_nitro_root.der`, serves port 8080)
+drive it; `demo/run_demo.sh` runs the loop locally with `MockNsm`. See `README.md`
+for the full deploy steps. The Containerfile `COPY`s `aws_nitro_root.der` (committed
+at the repo root) to `/etc/pq/` and pins its StageX base by digest — both must stay
+in sync with the real image; refresh the digest with the `docker inspect` recipe in
+the Containerfile header. A real NSM quote needs production Nitro — QEMU has no NSM
+device, so the ceremony's attestation step only fully succeeds when deployed.
 
 ## Status
 
