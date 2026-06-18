@@ -1,0 +1,22 @@
+[package]
+name = "pq-quote"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "AWS Nitro NSM attestation (COSE_Sign1) parsing and verification for the PQ enclave-binding demo"
+
+[dependencies]
+pq-bundle = { path = "../pq-bundle" }
+nsm-nitro-enclave-utils = { version = "0.1", default-features = false, features = ["verify"] }
+# nsm-nitro-enclave-utils 0.1.x requests x509-cert's `builder` feature, which was
+# removed in x509-cert 0.2.5. Pin to the last version that still exposes it.
+x509-cert = "=0.2.4"
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_bytes = "0.11"
+
+[lints]
+workspace = true

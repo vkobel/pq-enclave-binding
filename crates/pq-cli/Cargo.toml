@@ -1,0 +1,28 @@
+[package]
+name = "pq-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Command-line verifier/stamper for PQ enclave-binding root key bundles"
+
+[[bin]]
+name = "pq"
+path = "src/main.rs"
+
+[dependencies]
+pq-bundle = { path = "../pq-bundle" }
+pq-quote = { path = "../pq-quote" }
+pq-ots = { path = "../pq-ots", features = ["calendar-http"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+pq-core = { path = "../pq-core" }
+
+[lints]
+workspace = true

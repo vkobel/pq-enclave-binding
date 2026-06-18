@@ -1,0 +1,22 @@
+[package]
+name = "pq-ots"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "OpenTimestamps submission and Bitcoin-anchored proof verification for the PQ enclave-binding demo"
+
+[dependencies]
+opentimestamps = "0.2"
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+ureq = { version = "2", optional = true }
+
+[features]
+default = []
+# Real HTTP clients for calendar submission and Bitcoin header lookup (esplora).
+# Off by default so the crate (and its tests) build and run with no network.
+calendar-http = ["dep:ureq"]
+
+[lints]
+workspace = true

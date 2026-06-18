@@ -1,0 +1,19 @@
+[package]
+name = "pq-enclave"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "NSM attestation binding for the PQ enclave-binding demo"
+
+[dependencies]
+pq-core = { path = "../pq-core" }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+aws-nitro-enclaves-nsm-api = { version = "0.4", optional = true }
+
+[features]
+default = []
+nitro = ["dep:aws-nitro-enclaves-nsm-api"]
+
+[lints]
+workspace = true

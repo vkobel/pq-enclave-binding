@@ -1,0 +1,371 @@
+//! `pq` — verify and stamp PQ enclave-binding root key bundles.
+//!
+//! Ties together the pieces of the demo:
+//! * [`pq_quote::NitroQuoteVerifier`] — parse + verify the NSM COSE quote to a
+//!   pinned AWS root, as of a fixed instant.
+//! * [`pq_ots`] — verify the `OpenTimestamps` Bitcoin anchor (or stamp a bundle).
+//! * [`pq_bundle::verify`] — debug-mode rejection, PCR pinning, key binding, and
+//!   dual PQ-signature checks.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use base64::Engine as _;
+use clap::{Parser, Subcommand};
+use pq_bundle::{PqRootBundle, TimestampVerifier};
+use pq_ots::{BitcoinHeaderSource, EsploraHeaderSource, HttpCalendar};
+use pq_quote::NitroQuoteVerifier;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+#[derive(Parser)]
+#[command(name = "pq", about = "Verify and stamp PQ enclave-binding root key bundles")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Print a summary of a bundle without verifying it.
+    Inspect {
+        /// Path to bundle.json.
+        #[arg(long)]
+        bundle: PathBuf,
+    },
+    /// Fully verify a bundle: OTS anchor, Nitro quote, PCR pinning, binding, dual PQ sig.
+    Verify {
+        /// Path to bundle.json.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Path to the `.ots` timestamp proof.
+        #[arg(long)]
+        ots: PathBuf,
+        /// Path to the pinned AWS Nitro root CA (DER).
+        #[arg(long)]
+        root: PathBuf,
+        /// Local JSON header source: `{ "<height>": { "merkle_root": "<hex>", "time": <unix> } }`.
+        /// `merkle_root` is in internal byte order. Mutually exclusive with `--esplora`.
+        #[arg(long)]
+        headers: Option<PathBuf>,
+        /// Esplora API base URL (e.g. `https://blockstream.info/api`). Requires `--quote-time-unix`.
+        #[arg(long)]
+        esplora: Option<String>,
+        /// Instant (Unix seconds) to verify the Nitro certificate chain as of.
+        /// If omitted with `--headers`, the anchor block's `time` is used.
+        #[arg(long = "quote-time-unix")]
+        quote_time_unix: Option<u64>,
+    },
+    /// Submit a bundle's digest to OTS calendar servers, writing a `.ots` proof.
+    Stamp {
+        /// Path to bundle.json.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Output path for the `.ots` proof.
+        #[arg(long)]
+        out: PathBuf,
+        /// Calendar base URLs (tried in order; the first success wins).
+        #[arg(long = "calendar", default_values_t = default_calendars())]
+        calendars: Vec<String>,
+    },
+}
+
+fn default_calendars() -> Vec<String> {
+    vec![
+        "https://alice.btc.calendar.opentimestamps.org".to_string(),
+        "https://bob.btc.calendar.opentimestamps.org".to_string(),
+        "https://finney.calendar.eternitywall.com".to_string(),
+    ]
+}
+
+// ─── Header source ──────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct BlockInfo {
+    merkle_root: String,
+    #[serde(default)]
+    time: Option<u64>,
+}
+
+/// Header source resolved from CLI flags. Concrete enum (not `dyn`) so it can be
+/// passed to `pq_ots::verify`'s `&impl BitcoinHeaderSource`.
+enum HeaderSource {
+    Map {
+        roots: BTreeMap<u64, [u8; 32]>,
+        times: BTreeMap<u64, u64>,
+    },
+    Esplora(EsploraHeaderSource),
+}
+
+impl BitcoinHeaderSource for HeaderSource {
+    fn merkle_root(&self, height: usize) -> Result<[u8; 32], String> {
+        match self {
+            HeaderSource::Map { roots, .. } => roots
+                .get(&(height as u64))
+                .copied()
+                .ok_or_else(|| format!("no block at height {height} in header file")),
+            HeaderSource::Esplora(e) => e.merkle_root(height),
+        }
+    }
+}
+
+fn load_header_file(path: &Path) -> Result<HeaderSource> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("reading header file {}", path.display()))?;
+    let parsed: BTreeMap<u64, BlockInfo> =
+        serde_json::from_str(&raw).context("parsing header file JSON")?;
+
+    let mut roots = BTreeMap::new();
+    let mut times = BTreeMap::new();
+    for (height, info) in parsed {
+        let bytes = hex::decode(&info.merkle_root)
+            .with_context(|| format!("bad merkle_root hex for height {height}"))?;
+        let root: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("merkle_root for height {height} is not 32 bytes"))?;
+        roots.insert(height, root);
+        if let Some(t) = info.time {
+            times.insert(height, t);
+        }
+    }
+    Ok(HeaderSource::Map { roots, times })
+}
+
+// ─── OTS timestamp verifier adapter ─────────────────────────────────────────
+
+struct OtsTimestampVerifier<'a> {
+    source: &'a HeaderSource,
+}
+
+impl TimestampVerifier for OtsTimestampVerifier<'_> {
+    fn verify_timestamp(&self, bundle_digest: &[u8], ots_bytes: &[u8]) -> Result<(), String> {
+        let anchors =
+            pq_ots::verify(ots_bytes, bundle_digest, self.source).map_err(|e| e.to_string())?;
+        if anchors.is_empty() {
+            return Err("OTS proof has no Bitcoin anchor".to_string());
+        }
+        Ok(())
+    }
+}
+
+// ─── Commands ───────────────────────────────────────────────────────────────
+
+/// Hash the canonical `to_json()` form — must match `pq_bundle::verify`.
+fn bundle_digest(bundle: &PqRootBundle) -> Result<[u8; 32]> {
+    let json = bundle.to_json().context("serializing bundle")?;
+    Ok(Sha256::digest(json.as_bytes()).into())
+}
+
+fn load_bundle(path: &Path) -> Result<PqRootBundle> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("reading bundle {}", path.display()))?;
+    PqRootBundle::from_json(&raw).context("parsing bundle JSON")
+}
+
+fn cmd_inspect(path: &Path) -> Result<()> {
+    let bundle = load_bundle(path)?;
+    let ml = hex::decode(&bundle.ml_dsa_pk).context("ml_dsa_pk hex")?;
+    let slh = hex::decode(&bundle.slh_dsa_pk).context("slh_dsa_pk hex")?;
+    let quote = base64::engine::general_purpose::STANDARD
+        .decode(&bundle.nsm_quote)
+        .context("nsm_quote base64")?;
+
+    println!("bundle version:      {}", bundle.version);
+    println!("ml-dsa-65 pk:        {} bytes", ml.len());
+    println!("slh-dsa-128f pk:     {} bytes", slh.len());
+    println!("nsm quote:           {} bytes (COSE_Sign1)", quote.len());
+    println!("aws root ca sha256:  {}", bundle.aws_root_ca_sha256);
+    println!("expected PCR0:       {}", bundle.expected_pcrs.pcr0);
+    println!("expected PCR1:       {}", bundle.expected_pcrs.pcr1);
+    println!("expected PCR2:       {}", bundle.expected_pcrs.pcr2);
+    println!("digest (sha256):     {}", hex::encode(bundle_digest(&bundle)?));
+    Ok(())
+}
+
+fn cmd_verify(
+    bundle_path: &Path,
+    ots_path: &Path,
+    root_path: &Path,
+    headers: Option<&Path>,
+    esplora: Option<&str>,
+    quote_time_unix: Option<u64>,
+) -> Result<()> {
+    let bundle = load_bundle(bundle_path)?;
+    let ots_bytes =
+        fs::read(ots_path).with_context(|| format!("reading ots {}", ots_path.display()))?;
+    let root_der =
+        fs::read(root_path).with_context(|| format!("reading root CA {}", root_path.display()))?;
+    let digest = bundle_digest(&bundle)?;
+
+    let source = match (headers, esplora) {
+        (Some(_), Some(_)) => bail!("--headers and --esplora are mutually exclusive"),
+        (Some(p), None) => load_header_file(p)?,
+        (None, Some(url)) => HeaderSource::Esplora(EsploraHeaderSource::new(url.to_string())),
+        (None, None) => {
+            bail!("provide a Bitcoin header source: --headers <file> or --esplora <url>")
+        }
+    };
+
+    // Verify OTS up front so we can derive the anchor block time for the quote.
+    let anchors = pq_ots::verify(&ots_bytes, &digest, &source)
+        .context("OTS timestamp verification failed")?;
+    let earliest = anchors
+        .iter()
+        .min_by_key(|a| a.height)
+        .context("OTS proof produced no anchors")?;
+    println!("✓ OTS: bundle anchored in Bitcoin block {}", earliest.height);
+
+    let quote_time = match (quote_time_unix, &source) {
+        (Some(t), _) => t,
+        (None, HeaderSource::Map { times, .. }) => *times
+            .get(&(earliest.height as u64))
+            .context("anchor block has no `time` in header file; pass --quote-time-unix")?,
+        (None, HeaderSource::Esplora(_)) => bail!("--quote-time-unix is required with --esplora"),
+    };
+
+    let quote_verifier = NitroQuoteVerifier::at_unix_secs(root_der, quote_time);
+
+    // Cross-check that the pinned root matches the one the bundle recorded.
+    if quote_verifier.root_sha256_hex() != bundle.aws_root_ca_sha256 {
+        bail!(
+            "pinned root CA sha256 ({}) does not match bundle.aws_root_ca_sha256 ({})",
+            quote_verifier.root_sha256_hex(),
+            bundle.aws_root_ca_sha256
+        );
+    }
+
+    let ts_verifier = OtsTimestampVerifier { source: &source };
+    pq_bundle::verify(&bundle, &quote_verifier, Some((&ts_verifier, &ots_bytes)))
+        .context("bundle verification failed")?;
+
+    println!("✓ NSM quote verified against pinned AWS root (as of unix {quote_time})");
+    println!("✓ PCR0/1/2 pinning, debug-mode rejection, key binding, dual PQ signatures");
+    println!(
+        "\nVERIFIED: these PQ keys were generated in the attested enclave before Bitcoin block {}",
+        earliest.height
+    );
+    Ok(())
+}
+
+fn cmd_stamp(bundle_path: &Path, out: &Path, calendars: &[String]) -> Result<()> {
+    let bundle = load_bundle(bundle_path)?;
+    let digest = bundle_digest(&bundle)?;
+
+    let mut last_err = None;
+    for url in calendars {
+        let client = HttpCalendar::new(url.clone());
+        match pq_ots::stamp(&digest, &client) {
+            Ok(proof) => {
+                fs::write(out, &proof)
+                    .with_context(|| format!("writing proof {}", out.display()))?;
+                println!(
+                    "✓ stamped via {url}; wrote {} ({} bytes)",
+                    out.display(),
+                    proof.len()
+                );
+                println!("  upgrade the proof in ~a few hours once anchored in Bitcoin");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("calendar {url} failed: {e}");
+                last_err = Some(e);
+            }
+        }
+    }
+    match last_err {
+        Some(e) => Err(anyhow::anyhow!("all calendars failed; last error: {e}")),
+        None => bail!("no calendars configured"),
+    }
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Inspect { bundle } => cmd_inspect(&bundle),
+        Command::Verify {
+            bundle,
+            ots,
+            root,
+            headers,
+            esplora,
+            quote_time_unix,
+        } => cmd_verify(
+            &bundle,
+            &ots,
+            &root,
+            headers.as_deref(),
+            esplora.as_deref(),
+            quote_time_unix,
+        ),
+        Command::Stamp {
+            bundle,
+            out,
+            calendars,
+        } => cmd_stamp(&bundle, &out, &calendars),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_file_parses_and_resolves() {
+        let json = r#"{ "800000": { "merkle_root": "aa11bb22cc33dd44ee55ff66007788990011223344556677889900aabbccddee", "time": 1700000000 } }"#;
+        let path = std::env::temp_dir().join("pq_cli_headers_test.json");
+        fs::write(&path, json).unwrap();
+
+        let src = load_header_file(&path).unwrap();
+        let root = src.merkle_root(800_000).expect("present");
+        assert_eq!(root[0], 0xaa);
+        assert!(src.merkle_root(1).is_err());
+        match src {
+            HeaderSource::Map { times, .. } => {
+                assert_eq!(times.get(&800_000), Some(&1_700_000_000));
+            }
+            HeaderSource::Esplora(_) => panic!("expected map"),
+        }
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn ots_adapter_rejects_garbage() {
+        let src = HeaderSource::Map {
+            roots: BTreeMap::new(),
+            times: BTreeMap::new(),
+        };
+        let tv = OtsTimestampVerifier { source: &src };
+        assert!(tv.verify_timestamp(&[0u8; 32], b"not an ots proof").is_err());
+    }
+
+    #[test]
+    fn inspect_runs_on_a_generated_bundle() {
+        use pq_bundle::{ExpectedPcrs, PqRootBundle};
+        use pq_core::{canonical_payload, PqRootKeypair};
+
+        let kp = PqRootKeypair::generate();
+        let payload = canonical_payload(&kp.ml_dsa_pk(), &kp.slh_dsa_pk());
+        let sig = kp.sign_payload(&payload);
+
+        let bundle = PqRootBundle {
+            version: "1".to_string(),
+            ml_dsa_pk: hex::encode(kp.ml_dsa_pk()),
+            slh_dsa_pk: hex::encode(kp.slh_dsa_pk()),
+            nsm_quote: String::new(),
+            aws_root_ca_sha256: "00".repeat(32),
+            expected_pcrs: ExpectedPcrs {
+                pcr0: "11".repeat(48),
+                pcr1: "22".repeat(48),
+                pcr2: "33".repeat(48),
+            },
+            ml_dsa_sig: hex::encode(sig.ml_dsa),
+            slh_dsa_sig: hex::encode(sig.slh_dsa),
+        };
+        let path = std::env::temp_dir().join("pq_cli_inspect_test.json");
+        fs::write(&path, bundle.to_json().unwrap()).unwrap();
+        cmd_inspect(&path).expect("inspect should succeed");
+        fs::remove_file(&path).ok();
+    }
+}
