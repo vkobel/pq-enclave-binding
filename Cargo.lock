@@ -893,6 +893,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pq-ceremony"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "hex",
+ "pq-bundle",
+ "pq-core",
+ "pq-enclave",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "pq-cli"
 version = "0.1.0"
 dependencies = [
@@ -925,6 +941,7 @@ version = "0.1.0"
 dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "pq-core",
+ "serde_bytes",
  "sha2",
  "thiserror",
 ]

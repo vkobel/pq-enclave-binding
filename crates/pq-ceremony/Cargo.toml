@@ -1,0 +1,31 @@
+[package]
+name = "pq-ceremony"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "In-enclave PQ root key burn-in ceremony: generate, dual-sign, NSM-attest, and serve the bundle"
+
+[[bin]]
+name = "pq-ceremony"
+path = "src/main.rs"
+
+[dependencies]
+pq-core = { path = "../pq-core" }
+pq-enclave = { path = "../pq-enclave" }
+pq-bundle = { path = "../pq-bundle" }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+
+[features]
+default = []
+# Use the real AWS NSM device. Linux/Nitro only; off by default so the crate
+# builds and the local demo runs with MockNsm on any platform.
+nitro = ["pq-enclave/nitro"]
+
+[lints]
+workspace = true

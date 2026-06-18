@@ -46,6 +46,19 @@ pub trait Nsm {
         nonce: Option<Vec<u8>>,
         public_key: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, NsmError>;
+
+    /// Read the raw value of a single Platform Configuration Register.
+    ///
+    /// The ceremony uses this to record its *own* PCR0/1/2 into the bundle's
+    /// `expected_pcrs` — the enclave measures itself. These values must equal
+    /// the PCRs embedded in the attestation document (same enclave), and a
+    /// verifier independently re-derives them from the reproducible build.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NsmError`] if the NSM device is unavailable or returns an
+    /// error response.
+    fn describe_pcr(&self, index: u16) -> Result<Vec<u8>, NsmError>;
 }
 
 /// A mock NSM implementation that returns a deterministic fake document.
@@ -78,6 +91,14 @@ impl Nsm for MockNsm {
             r#"{{"mock":true,"user_data":"{ud_hex}","nonce":"{nonce_hex}","public_key":"{pk_hex}"}}"#
         );
         Ok(doc.into_bytes())
+    }
+
+    /// Return a deterministic, non-zero, 48-byte (SHA-384-sized) fake PCR so
+    /// that local/QEMU ceremonies produce a structurally valid bundle. These
+    /// are **not** real measurements and will not pass `caution verify`.
+    fn describe_pcr(&self, index: u16) -> Result<Vec<u8>, NsmError> {
+        let byte = u8::try_from(index % 251).unwrap_or(0).wrapping_add(1);
+        Ok(vec![byte; 48])
     }
 }
 
@@ -119,6 +140,24 @@ pub mod nitro {
             nsm_driver::nsm_exit(fd);
             match response {
                 Response::Attestation { document } => Ok(document),
+                Response::Error(e) => Err(NsmError::NsmError(format!("{e:?}"))),
+                _ => Err(NsmError::UnexpectedResponse),
+            }
+        }
+
+        /// Read a PCR via the real NSM `DescribePCR` request.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`NsmError::UnexpectedResponse`] for a non-`DescribePCR`
+        /// response, or [`NsmError::NsmError`] if the driver returns an error.
+        fn describe_pcr(&self, index: u16) -> Result<Vec<u8>, NsmError> {
+            let fd = nsm_driver::nsm_init();
+            let request = Request::DescribePCR { index };
+            let response = nsm_driver::nsm_process_request(fd, request);
+            nsm_driver::nsm_exit(fd);
+            match response {
+                Response::DescribePCR { lock: _, data } => Ok(data),
                 Response::Error(e) => Err(NsmError::NsmError(format!("{e:?}"))),
                 _ => Err(NsmError::UnexpectedResponse),
             }
