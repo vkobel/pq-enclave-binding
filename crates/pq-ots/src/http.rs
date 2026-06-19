@@ -49,11 +49,10 @@ impl EsploraHeaderSource {
             base_url: base_url.into(),
         }
     }
-}
 
-impl BitcoinHeaderSource for EsploraHeaderSource {
-    fn merkle_root(&self, height: usize) -> Result<[u8; 32], String> {
-        // height -> block hash
+    /// Fetch the raw JSON body of the block at `height` (`height` → hash → block).
+    /// The response carries both `merkle_root` and `timestamp`.
+    fn block_json(&self, height: usize) -> Result<String, String> {
         let hash_url = format!("{}/block-height/{height}", self.base_url);
         let block_hash = ureq::get(&hash_url)
             .call()
@@ -63,26 +62,50 @@ impl BitcoinHeaderSource for EsploraHeaderSource {
             .map_err(|e| format!("reading block hash: {e}"))?;
         let block_hash = block_hash.trim();
 
-        // block hash -> block details (merkle_root as big-endian display hex)
         let block_url = format!("{}/block/{block_hash}", self.base_url);
-        let body = ureq::get(&block_url)
+        ureq::get(&block_url)
             .call()
             .map_err(|e| format!("GET {block_url}: {e}"))?
             .into_body()
             .read_to_string()
-            .map_err(|e| format!("reading block: {e}"))?;
+            .map_err(|e| format!("reading block: {e}"))
+    }
+}
 
-        // crude extraction of the "merkle_root":"<hex>" field to avoid a JSON dep
-        let key = "\"merkle_root\":\"";
-        let start = body
-            .find(key)
-            .ok_or_else(|| "no merkle_root in block response".to_string())?
-            + key.len();
-        let end = body[start..]
-            .find('"')
-            .ok_or_else(|| "malformed merkle_root field".to_string())?
-            + start;
-        let display_hex = &body[start..end];
+/// Extract a quoted string field (`"name":"<value>"`) from a compact JSON body,
+/// avoiding a JSON dependency. esplora returns compact, unspaced JSON.
+fn json_str_field<'a>(body: &'a str, name: &str) -> Result<&'a str, String> {
+    let key = format!("\"{name}\":\"");
+    let start = body
+        .find(&key)
+        .ok_or_else(|| format!("no {name} in block response"))?
+        + key.len();
+    let end = body[start..]
+        .find('"')
+        .ok_or_else(|| format!("malformed {name} field"))?
+        + start;
+    Ok(&body[start..end])
+}
+
+/// Extract an unquoted numeric field (`"name":<digits>`) from a compact JSON body.
+fn json_u64_field(body: &str, name: &str) -> Result<u64, String> {
+    let key = format!("\"{name}\":");
+    let start = body
+        .find(&key)
+        .ok_or_else(|| format!("no {name} in block response"))?
+        + key.len();
+    let rest = &body[start..];
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end]
+        .parse::<u64>()
+        .map_err(|e| format!("bad {name} number {:?}: {e}", &rest[..end]))
+}
+
+impl BitcoinHeaderSource for EsploraHeaderSource {
+    fn merkle_root(&self, height: usize) -> Result<[u8; 32], String> {
+        let body = self.block_json(height)?;
+        // merkle_root is reported as big-endian display hex
+        let display_hex = json_str_field(&body, "merkle_root")?;
 
         let mut bytes = hex::decode(display_hex)
             .map_err(|e| format!("bad merkle_root hex {display_hex:?}: {e}"))?;
@@ -94,5 +117,10 @@ impl BitcoinHeaderSource for EsploraHeaderSource {
         let mut root = [0u8; 32];
         root.copy_from_slice(&bytes);
         Ok(root)
+    }
+
+    fn block_time(&self, height: usize) -> Result<Option<u64>, String> {
+        let body = self.block_json(height)?;
+        Ok(Some(json_u64_field(&body, "timestamp")?))
     }
 }

@@ -53,8 +53,10 @@ enum Command {
         /// Esplora API base URL (e.g. `https://blockstream.info/api`). Requires `--quote-time-unix`.
         #[arg(long)]
         esplora: Option<String>,
-        /// Instant (Unix seconds) to verify the Nitro certificate chain as of.
-        /// If omitted with `--headers`, the anchor block's `time` is used.
+        /// Override the instant (Unix seconds) to verify the Nitro certificate
+        /// chain as of. Normally omitted: the anchor block's own timestamp is
+        /// used (fetched from `--esplora`, or read from the `--headers` `time`
+        /// field). Only needed if a header file omits `time`.
         #[arg(long = "quote-time-unix")]
         quote_time_unix: Option<u64>,
     },
@@ -107,6 +109,14 @@ impl BitcoinHeaderSource for HeaderSource {
                 .copied()
                 .ok_or_else(|| format!("no block at height {height} in header file")),
             HeaderSource::Esplora(e) => e.merkle_root(height),
+        }
+    }
+
+    fn block_time(&self, height: usize) -> Result<Option<u64>, String> {
+        match self {
+            // The header file may omit `time`; then we have nothing to offer.
+            HeaderSource::Map { times, .. } => Ok(times.get(&(height as u64)).copied()),
+            HeaderSource::Esplora(e) => e.block_time(height),
         }
     }
 }
@@ -217,12 +227,21 @@ fn cmd_verify(
         .context("OTS proof produced no anchors")?;
     println!("✓ OTS: bundle anchored in Bitcoin block {}", earliest.height);
 
-    let quote_time = match (quote_time_unix, &source) {
-        (Some(t), _) => t,
-        (None, HeaderSource::Map { times, .. }) => *times
-            .get(&(earliest.height as u64))
-            .context("anchor block has no `time` in header file; pass --quote-time-unix")?,
-        (None, HeaderSource::Esplora(_)) => bail!("--quote-time-unix is required with --esplora"),
+    // Verify the (quantum-breakable) Nitro chain *as of the anchor block's time*.
+    // Derive that instant from the proven anchor block itself; `--quote-time-unix`
+    // is only an override (and the sole option if a header file omits `time`).
+    let quote_time = match quote_time_unix {
+        Some(t) => t,
+        None => source
+            .block_time(earliest.height)
+            .map_err(|e| anyhow::anyhow!("looking up anchor block {} time: {e}", earliest.height))?
+            .with_context(|| {
+                format!(
+                    "anchor block {} has no `time` (header file omitted it); \
+                     pass --quote-time-unix",
+                    earliest.height
+                )
+            })?,
     };
 
     let quote_verifier = NitroQuoteVerifier::at_unix_secs(root_der, quote_time);

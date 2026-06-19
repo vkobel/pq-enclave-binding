@@ -91,17 +91,22 @@ Caused by:
 This CLI does **not** upgrade for you. Wait ~a few hours for the digest to be
 mined, then upgrade the `.ots` in place with the reference OpenTimestamps client:
 
-```bash
-pip install opentimestamps-client      # one-time
+```console
+$ uv tool install opentimestamps-client      # one-time
 
-ots upgrade bundle.json.ots            # pulls the now-anchored proof from the calendars
-ots info    bundle.json.ots            # confirm a "bitcoin block <height>" attestation appears
+$ ots upgrade bundle.json.ots
+Got 1 attestation(s) from https://alice.btc.calendar.opentimestamps.org
+Success! Timestamp complete
 ```
 
 `ots upgrade` walks the pending calendar URIs in the proof, fetches the
-Bitcoin-anchored version, and rewrites `bundle.json.ots` (leaving a `.bak`). If it
-reports still-pending, the digest isn't in a block yet — wait and retry. `ots`
-needs network for this; `pq verify` itself stays offline.
+Bitcoin-anchored version, and rewrites `bundle.json.ots` (leaving a `.bak`) — the
+proof now carries a real **Bitcoin block attestation** instead of only pending
+calendar entries. If it reports still-pending, the digest isn't in a block yet —
+wait and retry. `ots` needs network for this; `pq verify` itself stays offline.
+
+> `pq verify` against the live chain requires this **upgraded** proof — a
+> pending-only `.ots` is what triggers the "not anchored in Bitcoin yet" error.
 
 ### 5. Verify the *live* enclave — `caution verify`
 
@@ -145,31 +150,20 @@ the reproducible build *is* the measurement the bundle pins against.
 
 ### 6. Verify the *bundle* — `pq verify` (offline, durable)
 
-First find the **time of the Bitcoin block the proof is anchored in** — `pq verify`
-checks the Nitro certificate chain *as of that instant*, not now (see
-[Verification time](#verification-time-the-anchor-block-not-now) below for why).
-Two hops:
-
-```bash
-ots info bundle.json.ots                     # → "bitcoin block <height> attestation"
-hash=$(curl -s https://blockstream.info/api/block-height/<height>)
-curl -s https://blockstream.info/api/block/$hash | jq .timestamp   # → <anchor-block-time>
-```
-
-Then verify:
+No timestamps to look up by hand: `pq verify` reads the anchor block out of the
+proof and fetches that block's time itself.
 
 ```console
 $ ./target/debug/pq verify \
     --bundle  bundle.json \
     --ots     bundle.json.ots \
     --root    aws_nitro_root.der \
-    --esplora https://blockstream.info/api \
-    --quote-time-unix <anchor-block-time>
-✓ OTS: bundle anchored in Bitcoin block <height>
-✓ NSM quote verified against pinned AWS root (as of unix <anchor-block-time>)
+    --esplora https://blockstream.info/api
+✓ OTS: bundle anchored in Bitcoin block 954272
+✓ NSM quote verified against pinned AWS root (as of unix 1781799289)
 ✓ PCR0/1/2 pinning, debug-mode rejection, key binding, dual PQ signatures
 
-VERIFIED: these PQ keys were generated in the attested enclave before Bitcoin block <height>
+VERIFIED: these PQ keys were generated in the attested enclave before Bitcoin block 954272
 ```
 
 `pq verify` is **fully offline with respect to the enclave** — it reads only the
@@ -177,9 +171,20 @@ bundle, the `.ots`, the pinned root CA, and a Bitcoin header source, and never
 calls the enclave or uses a nonce. It checks the quote *embedded in the bundle*
 as of the OTS anchor block time, not a live endpoint.
 
+What it enforces, failing on the first miss:
+
+1. **OTS anchor** — the proof commits to `SHA-256(bundle)` and every Bitcoin
+   attestation's Merkle root matches the block header from the source.
+2. **Pinned root CA** — `SHA-256(--root)` equals the bundle's `aws_root_ca_sha256`.
+3. **NSM quote** — `COSE_Sign1` parses, the ES384 signature verifies, and the cert
+   chain validates **to the pinned root as of the anchor block's time**.
+4. **Debug-mode rejection** — PCR0/1/2 are not all-zero.
+5. **PCR pinning** — quote PCR0/1/2 equal the bundle's `expected_pcrs`.
+6. **Key binding** — `quote.user_data == "pq-keyfork-v1:" || SHA-256(canonical_payload)`.
+7. **Dual PQ signatures** — ML-DSA-65 **and** SLH-DSA-SHAKE-128f over the payload.
+
 Get `aws_nitro_root.der` once, out of band (see
-[Prerequisites](#1-prerequisites)); `pq verify` cross-checks its SHA-256 against
-the `aws_root_ca_sha256` recorded in the bundle.
+[Prerequisites](#1-prerequisites)); check (2) ties it to the bundle.
 
 #### Verification time: the anchor block, not now
 
@@ -187,30 +192,27 @@ A Nitro leaf certificate lives only a few hours, and AWS signs it with
 quantum-breakable ECDSA P-384. So verifying the chain against the **current** clock
 is both broken (the cert expired long ago) and meaningless after Q-Day. `pq verify`
 instead checks the chain **as of the instant the bundle was timestamped into
-Bitcoin** — when the cert was valid and its signature still sound. That instant is
-`--quote-time-unix`, in Unix seconds.
+Bitcoin** — when the cert was valid and its signature still sound (see the
+`as of unix 1781799289` line above).
 
-Set it to the **timestamp of the anchor block** (the two-hop recipe above). It need
-not be the exact block time — any instant inside the leaf cert's validity window
-works — but the block time is the principled, reproducible choice.
+That instant is derived from the **proven anchor block itself**, not supplied by
+you: `pq verify` takes the earliest Bitcoin block in the upgraded proof and looks
+up its timestamp (from `--esplora`, or the `"time"` field of a `--headers` file).
+This is deliberate — deriving the time from the anchor removes any chance of
+verifying against an attacker-chosen instant where a stale or forged certificate
+would validate.
 
-Whether the flag is **required** depends on your Bitcoin header source:
-
-| Source | `--quote-time-unix` |
-|---|---|
-| `--esplora <url>` | **Required** — esplora can't supply the time to the check, so you must pass it. |
-| `--headers <file>` | **Optional** — if the anchor block's entry has a `"time"` field, it's used automatically; pass the flag only to override. |
-
-So the fully offline, self-contained form needs no flag — put the time in the
-header file instead:
+`--quote-time-unix <secs>` exists only as a manual **override**, and is needed in
+just one case: a `--headers` file that omits `"time"` for the anchor block. The
+offline, self-contained header form is otherwise complete:
 
 ```json
-{ "<height>": { "merkle_root": "<internal-byte-order-hex>", "time": <anchor-block-time> } }
+{ "954272": { "merkle_root": "<internal-byte-order-hex>", "time": 1781799289 } }
 ```
 
 ```bash
 pq verify --bundle bundle.json --ots bundle.json.ots \
-  --root aws_nitro_root.der --headers headers.json     # no --quote-time-unix needed
+  --root aws_nitro_root.der --headers headers.json     # time taken from the file
 ```
 
 (`merkle_root` is **internal byte order** — reverse the big-endian hex explorers
@@ -379,8 +381,7 @@ caution verify
 
 # (b) The bundle itself — fully offline (after the .ots is anchored, ~hours later).
 pq verify --bundle bundle.json --ots bundle.json.ots \
-  --root aws_nitro_root.der --esplora https://blockstream.info/api \
-  --quote-time-unix <anchor-block-time>
+  --root aws_nitro_root.der --esplora https://blockstream.info/api
 ```
 
 See [the walkthrough](#walkthrough-the-full-loop-against-a-live-enclave) (steps
@@ -412,22 +413,39 @@ pq verify \
   --bundle  bundle.json \
   --ots     bundle.json.ots \
   --root    aws_nitro_root.der \           # pinned out-of-band; cross-checked vs bundle
-  --headers headers.json                   # { "<height>": { "merkle_root": "<hex>", "time": <unix> } }
-# or, instead of --headers, hit a live explorer (then --quote-time-unix is required):
-#   --esplora https://blockstream.info/api --quote-time-unix <anchor-block-time>
+  --esplora https://blockstream.info/api   # or --headers headers.json (offline)
 ```
 
 Flags:
 - `--root` — the pinned AWS Nitro root CA (DER), fetched out of band; its SHA-256
   is cross-checked against `aws_root_ca_sha256` in the bundle.
 - `--headers` **or** `--esplora` — the Bitcoin header source (mutually exclusive).
-  `merkle_root` in the header file is **internal byte order** — reverse the
-  big-endian hex explorers display.
-- `--quote-time-unix` — Unix-seconds instant to verify the Nitro cert chain as of;
-  use the **anchor block's timestamp**. **Required with `--esplora`**; with
-  `--headers` it defaults to the block's `"time"` field. See
-  [Verification time](#verification-time-the-anchor-block-not-now) for why and how
-  to obtain it.
+  `merkle_root` in a header file is **internal byte order** — reverse the
+  big-endian hex explorers display. Header entry shape:
+  `{ "<height>": { "merkle_root": "<hex>", "time": <unix> } }`.
+- `--quote-time-unix` — **optional override** for the instant the Nitro cert chain
+  is verified as of. Normally omitted: the anchor block's own timestamp is used
+  (fetched via `--esplora`, or read from a `--headers` `"time"` field). Needed only
+  if a header file omits `"time"`. See
+  [Verification time](#verification-time-the-anchor-block-not-now).
+
+### Why `pq stamp`, not `ots stamp`?
+
+`pq stamp` is an OTS stamp specialized so the proof is directly checkable by
+`pq verify`:
+
+- It commits to `SHA-256(bundle.to_json())` — the **canonical** re-serialization
+  the verifier reconstructs — not the raw on-disk bytes, so reformatting the JSON
+  can't invalidate the proof.
+- It **omits the OTS privacy nonce**. Stock `ots stamp` prepends random bytes so
+  the calendar never learns your file's hash; that's pure privacy and irrelevant
+  for a *public* bundle. Skipping it keeps `start_digest == SHA-256(bundle)`, which
+  is exactly what `pq verify` checks — a nonce-wrapped `ots stamp` proof would fail
+  `pq verify`'s digest check. (This privacy nonce is unrelated to the *attestation*
+  challenge nonce in `caution verify`.)
+- It tries several calendars in order (failover) from the one Rust binary.
+
+It does **not** upgrade — once anchored, that's still `ots upgrade` (step 4).
 
 ---
 

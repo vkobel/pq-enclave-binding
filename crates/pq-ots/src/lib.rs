@@ -89,6 +89,19 @@ pub trait BitcoinHeaderSource {
     /// # Errors
     /// Returns an error string if the height is unknown or the lookup failed.
     fn merkle_root(&self, height: usize) -> Result<[u8; 32], String>;
+
+    /// Return the block's Unix timestamp, if this source can provide it.
+    ///
+    /// Used to verify the (quantum-breakable) Nitro certificate chain *as of the
+    /// anchor block's time*. The default returns `Ok(None)` — a source with no
+    /// time information (the caller must then supply the instant explicitly).
+    ///
+    /// # Errors
+    /// Returns an error string if the lookup was attempted but failed (e.g. a
+    /// network error). `Ok(None)` means "this source has no time", not a failure.
+    fn block_time(&self, _height: usize) -> Result<Option<u64>, String> {
+        Ok(None)
+    }
 }
 
 /// Submits a digest to an OTS calendar and returns the calendar's serialized
