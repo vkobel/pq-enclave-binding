@@ -91,6 +91,24 @@ pub struct QuoteData {
     pub user_data: Vec<u8>,
 }
 
+/// The facts `verify` confirmed, returned on success so callers can render an
+/// explicit, itemised report. Every field is a value that *passed* its check.
+#[derive(Debug, Clone)]
+pub struct VerifyReport {
+    /// Quote PCR0 — equal to `bundle.expected_pcrs.pcr0` (pinning checked).
+    pub pcr0: Vec<u8>,
+    /// Quote PCR1 — equal to `bundle.expected_pcrs.pcr1`.
+    pub pcr1: Vec<u8>,
+    /// Quote PCR2 — equal to `bundle.expected_pcrs.pcr2`.
+    pub pcr2: Vec<u8>,
+    /// The quote's `user_data` — equal to `user_data_commitment(canonical_payload)`.
+    pub user_data: Vec<u8>,
+    /// Length of the ML-DSA-65 public key whose signature verified.
+    pub ml_dsa_pk_len: usize,
+    /// Length of the SLH-DSA-SHAKE-128f public key whose signature verified.
+    pub slh_dsa_pk_len: usize,
+}
+
 /// Abstracts NSM quote parsing and signature verification.
 ///
 /// Implement this trait to supply a real AWS Nitro quote verifier (which must
@@ -211,7 +229,7 @@ pub fn verify(
     bundle: &PqRootBundle,
     quote_verifier: &dyn QuoteVerifier,
     ts_verifier: Option<(&dyn TimestampVerifier, &[u8])>,
-) -> Result<(), Error> {
+) -> Result<VerifyReport, Error> {
     // ── Decode fields ────────────────────────────────────────────────────────
     let ml_pk = hex::decode(&bundle.ml_dsa_pk).map_err(|e| Error::HexDecode {
         field: "ml_dsa_pk",
@@ -286,7 +304,14 @@ pub fn verify(
     };
     verify_dual(&ml_pk, &slh_pk, &payload, &dual_sig)?;
 
-    Ok(())
+    Ok(VerifyReport {
+        pcr0: quote_data.pcr0,
+        pcr1: quote_data.pcr1,
+        pcr2: quote_data.pcr2,
+        user_data: quote_data.user_data,
+        ml_dsa_pk_len: ml_pk.len(),
+        slh_dsa_pk_len: slh_pk.len(),
+    })
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

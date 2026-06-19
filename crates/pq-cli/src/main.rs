@@ -218,6 +218,9 @@ fn cmd_verify(
         }
     };
 
+    println!("Verifying {} ...\n", bundle_path.display());
+
+    // ── [1/7] OTS anchor ─────────────────────────────────────────────────────
     // Verify OTS up front so we can derive the anchor block time for the quote.
     let anchors = pq_ots::verify(&ots_bytes, &digest, &source)
         .context("OTS timestamp verification failed")?;
@@ -225,7 +228,6 @@ fn cmd_verify(
         .iter()
         .min_by_key(|a| a.height)
         .context("OTS proof produced no anchors")?;
-    println!("✓ OTS: bundle anchored in Bitcoin block {}", earliest.height);
 
     // Verify the (quantum-breakable) Nitro chain *as of the anchor block's time*.
     // Derive that instant from the proven anchor block itself; `--quote-time-unix`
@@ -243,10 +245,13 @@ fn cmd_verify(
                 )
             })?,
     };
+    println!("✓ [1/7] OTS timestamp — bundle digest committed to Bitcoin");
+    println!("          digest {}", hex::encode(digest));
+    println!("          anchored in block {} (time: unix {quote_time})", earliest.height);
 
     let quote_verifier = NitroQuoteVerifier::at_unix_secs(root_der, quote_time);
 
-    // Cross-check that the pinned root matches the one the bundle recorded.
+    // ── [2/7] Pinned root CA cross-check ─────────────────────────────────────
     if quote_verifier.root_sha256_hex() != bundle.aws_root_ca_sha256 {
         bail!(
             "pinned root CA sha256 ({}) does not match bundle.aws_root_ca_sha256 ({})",
@@ -254,15 +259,34 @@ fn cmd_verify(
             bundle.aws_root_ca_sha256
         );
     }
+    println!("✓ [2/7] Pinned AWS root CA matches the bundle");
+    println!("          sha256 {}", bundle.aws_root_ca_sha256);
 
+    // ── [3/7]–[7/7] quote sig, debug-reject, PCR pin, binding, dual PQ sig ────
     let ts_verifier = OtsTimestampVerifier { source: &source };
-    pq_bundle::verify(&bundle, &quote_verifier, Some((&ts_verifier, &ots_bytes)))
+    let report = pq_bundle::verify(&bundle, &quote_verifier, Some((&ts_verifier, &ots_bytes)))
         .context("bundle verification failed")?;
 
-    println!("✓ NSM quote verified against pinned AWS root (as of unix {quote_time})");
-    println!("✓ PCR0/1/2 pinning, debug-mode rejection, key binding, dual PQ signatures");
+    println!("✓ [3/7] NSM quote — COSE_Sign1 ES384 signature + cert chain valid");
+    println!("          to the pinned root, as of unix {quote_time} (anchor block time)");
+    println!("✓ [4/7] Debug-mode rejected — PCR0/1/2 are not all-zero");
+    println!("✓ [5/7] PCR pinning — quote PCR0/1/2 == bundle.expected_pcrs");
+    println!("          PCR0 {}", hex::encode(&report.pcr0));
+    println!("          PCR1 {}", hex::encode(&report.pcr1));
+    println!("          PCR2 {}", hex::encode(&report.pcr2));
     println!(
-        "\nVERIFIED: these PQ keys were generated in the attested enclave before Bitcoin block {}",
+        "✓ [6/7] Key binding — quote.user_data == \"pq-keyfork-v1:\" || SHA-256(canonical_payload)"
+    );
+    println!("          user_data {}", hex::encode(&report.user_data));
+    println!("✓ [7/7] Dual PQ signatures valid over canonical_payload");
+    println!(
+        "          ML-DSA-65 pk {} B  +  SLH-DSA-SHAKE-128f pk {} B",
+        report.ml_dsa_pk_len, report.slh_dsa_pk_len
+    );
+
+    println!("\nVERIFIED — these PQ public keys were generated inside the attested");
+    println!(
+        "enclave (PCRs above) and the bundle existed before Bitcoin block {}.",
         earliest.height
     );
     Ok(())
