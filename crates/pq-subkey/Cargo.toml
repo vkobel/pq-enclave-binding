@@ -1,0 +1,17 @@
+[package]
+name = "pq-subkey"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Root-certified post-quantum subkey delegation (Approach A) for the PQ enclave-binding demo."
+
+[dependencies]
+pq-core = { path = "../pq-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

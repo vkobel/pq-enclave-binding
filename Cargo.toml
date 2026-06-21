@@ -8,6 +8,7 @@ members = [
     "crates/pq-quote",
     "crates/pq-cli",
     "crates/pq-ceremony",
+    "crates/pq-subkey",
 ]
 
 [workspace.package]
