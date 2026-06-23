@@ -1,0 +1,5 @@
+# keyfork crates (keyfork-mnemonic, keyfork-derive-util) are published to
+# Distrust's own cargo registry, not crates.io. `pq-derive` consumes them for
+# deterministic PQ key derivation. See crates/pq-derive.
+[registries.distrust]
+index = "https://git.distrust.co/public/_cargo-index.git"
