@@ -72,6 +72,19 @@ enum Command {
         #[arg(long = "calendar", default_values_t = default_calendars())]
         calendars: Vec<String>,
     },
+    /// Verify a subkey's birth-provenance (Merkle membership) and, if given a
+    /// message, its dual signature.
+    VerifySubkey {
+        /// Path to bundle.json (provides the anchored subkey Merkle root).
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Path to the subkey JSON (a `/sign` or `/subkey/<i>` response).
+        #[arg(long)]
+        subkey: PathBuf,
+        /// Optional message (hex) the subkey claims to have signed.
+        #[arg(long = "message-hex")]
+        message_hex: Option<String>,
+    },
 }
 
 fn default_calendars() -> Vec<String> {
@@ -190,6 +203,8 @@ fn cmd_inspect(path: &Path) -> Result<()> {
     println!("expected PCR0:       {}", bundle.expected_pcrs.pcr0);
     println!("expected PCR1:       {}", bundle.expected_pcrs.pcr1);
     println!("expected PCR2:       {}", bundle.expected_pcrs.pcr2);
+    println!("subkey merkle root:  {}", bundle.subkey_merkle_root);
+    println!("subkey count:        {}", bundle.subkey_count);
     println!("digest (sha256):     {}", hex::encode(bundle_digest(&bundle)?));
     Ok(())
 }
@@ -323,6 +338,62 @@ fn cmd_stamp(bundle_path: &Path, out: &Path, calendars: &[String]) -> Result<()>
     }
 }
 
+#[derive(serde::Deserialize)]
+struct SubkeyResponse {
+    index: u32,
+    purpose_tag: u8,
+    ml_dsa_pk: String,
+    slh_dsa_pk: String,
+    #[serde(default)]
+    ml_dsa_sig: Option<String>,
+    #[serde(default)]
+    slh_dsa_sig: Option<String>,
+    merkle_proof: Vec<String>,
+}
+
+fn verify_subkey(bundle_path: &Path, subkey_path: &Path, message_hex: Option<&str>) -> Result<()> {
+    let bundle = PqRootBundle::from_json(&fs::read_to_string(bundle_path)?)?;
+    let sk: SubkeyResponse = serde_json::from_str(&fs::read_to_string(subkey_path)?)?;
+
+    let root: [u8; 32] = hex::decode(&bundle.subkey_merkle_root)
+        .context("decoding bundle.subkey_merkle_root")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("subkey_merkle_root is not 32 bytes"))?;
+    let ml_pk = hex::decode(&sk.ml_dsa_pk).context("subkey ml_dsa_pk")?;
+    let slh_pk = hex::decode(&sk.slh_dsa_pk).context("subkey slh_dsa_pk")?;
+    let siblings: Vec<[u8; 32]> = sk
+        .merkle_proof
+        .iter()
+        .map(|h| {
+            hex::decode(h)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .context("merkle_proof node must be 32-byte hex")
+        })
+        .collect::<Result<_>>()?;
+
+    if !pq_merkle::verify_membership(&root, sk.index, sk.purpose_tag, &ml_pk, &slh_pk, &siblings) {
+        bail!("✗ membership proof FAILED — subkey is not in the anchored set");
+    }
+    println!("✓ birth-provenance — subkey #{} is committed in the enclave's anchored set", sk.index);
+
+    if let Some(msg_hex) = message_hex {
+        let msg = hex::decode(msg_hex).context("--message-hex")?;
+        let (Some(ml_sig), Some(slh_sig)) = (&sk.ml_dsa_sig, &sk.slh_dsa_sig) else {
+            bail!("--message-hex given but subkey JSON has no signatures");
+        };
+        let dual = pq_core::DualSignature {
+            ml_dsa: hex::decode(ml_sig).context("ml_dsa_sig")?,
+            slh_dsa: hex::decode(slh_sig).context("slh_dsa_sig")?,
+        };
+        pq_core::verify_dual(&ml_pk, &slh_pk, &msg, &dual).context("subkey signature")?;
+        println!("✓ authenticity — dual signature over the message verifies");
+    }
+
+    println!("\nVERIFIED — this subkey was generated inside the attested enclave.");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -347,6 +418,11 @@ fn main() -> Result<()> {
             out,
             calendars,
         } => cmd_stamp(&bundle, &out, &calendars),
+        Command::VerifySubkey {
+            bundle,
+            subkey,
+            message_hex,
+        } => verify_subkey(&bundle, &subkey, message_hex.as_deref()),
     }
 }
 
@@ -403,6 +479,8 @@ mod tests {
                 pcr1: "22".repeat(48),
                 pcr2: "33".repeat(48),
             },
+            subkey_merkle_root: "00".repeat(32),
+            subkey_count: 0,
             ml_dsa_sig: hex::encode(sig.ml_dsa),
             slh_dsa_sig: hex::encode(sig.slh_dsa),
         };

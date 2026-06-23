@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 pq-bundle = { path = "../pq-bundle" }
+pq-core = { path = "../pq-core" }
+pq-merkle = { path = "../pq-merkle" }
 pq-quote = { path = "../pq-quote" }
 pq-ots = { path = "../pq-ots", features = ["calendar-http"] }
 clap = { version = "4", features = ["derive"] }
