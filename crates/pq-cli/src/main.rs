@@ -290,10 +290,10 @@ fn cmd_verify(
     println!("          PCR1 {}", hex::encode(&report.pcr1));
     println!("          PCR2 {}", hex::encode(&report.pcr2));
     println!(
-        "✓ [6/7] Key binding — quote.user_data == \"pq-keyfork-v1:\" || SHA-256(canonical_payload)"
+        "✓ [6/7] Key binding — quote.user_data == \"pq-keyfork-v1:\" || SHA-256(canonical_payload_with_subkeys)"
     );
     println!("          user_data {}", hex::encode(&report.user_data));
-    println!("✓ [7/7] Dual PQ signatures valid over canonical_payload");
+    println!("✓ [7/7] Dual PQ signatures valid over canonical_payload_with_subkeys");
     println!(
         "          ML-DSA-65 pk {} B  +  SLH-DSA-SHAKE-128f pk {} B",
         report.ml_dsa_pk_len, report.slh_dsa_pk_len

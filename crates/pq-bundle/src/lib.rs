@@ -13,10 +13,10 @@
 //! 1. **Debug-mode rejection** — PCR0/1/2 must not all be zero.
 //! 2. **PCR pinning** — PCR0/1/2 from the quote must equal the values stored in
 //!    the bundle's `expected_pcrs`.
-//! 3. **Binding** — `quote.user_data` must equal
-//!    `USER_DATA_PREFIX || SHA-256(canonical_payload(ml_dsa_pk, slh_dsa_pk))`.
+//! 3. **Binding** — `quote.user_data` must equal `USER_DATA_PREFIX ||
+//!    SHA-256(canonical_payload_with_subkeys(ml_dsa_pk, slh_dsa_pk, subkey_merkle_root))`.
 //! 4. **Dual PQ signature** — both ML-DSA and SLH-DSA signatures over
-//!    `canonical_payload` must verify.
+//!    `canonical_payload_with_subkeys` must verify.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use pq_core::{canonical_payload_with_subkeys, user_data_commitment, verify_dual, DualSignature};
@@ -225,8 +225,8 @@ impl PqRootBundle {
 /// 1. Decode the NSM quote (base64) and call `quote_verifier.verify_quote`.
 /// 2. **Debug-mode rejection**: fail if PCR0, PCR1, and PCR2 are all-zero.
 /// 3. **PCR pinning**: quote PCR0/1/2 must match `bundle.expected_pcrs`.
-/// 4. **Binding**: `quote.user_data == USER_DATA_PREFIX || SHA-256(canonical_payload)`.
-/// 5. **Dual PQ signature**: ML-DSA + SLH-DSA over `canonical_payload`.
+/// 4. **Binding**: `quote.user_data == USER_DATA_PREFIX || SHA-256(canonical_payload_with_subkeys)`.
+/// 5. **Dual PQ signature**: ML-DSA + SLH-DSA over `canonical_payload_with_subkeys`.
 ///
 /// If `ts_verifier` and `ots_bytes` are both `Some`, step 0 additionally
 /// verifies the OTS timestamp proof.
