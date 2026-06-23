@@ -119,6 +119,21 @@ pub fn derive_node(mnemonic: &Mnemonic, path: &DerivationPath) -> Result<[u8; 32
     Ok(child.private_key().to_bytes())
 }
 
+/// Build the hardened subkey path `m/account'/index'`.
+///
+/// `account` is the purpose lane (1 = Auth, 2 = Encryption by convention);
+/// `index` enumerates subkeys within that lane.
+///
+/// # Panics
+/// Panics only if keyfork's hardened-index construction rejects the values,
+/// which it does not for any `u32` (the hardened bit is set internally).
+#[must_use]
+pub fn subkey_path(account: u32, index: u32) -> DerivationPath {
+    use std::str::FromStr as _;
+    DerivationPath::from_str(&format!("m/{account}'/{index}'"))
+        .expect("hardened u32 path is always valid")
+}
+
 /// Derive a full PQ root/subkey keypair at `path` from `mnemonic`.
 ///
 /// Equivalent to `PqRootKeypair::from_seed(&derive_node(mnemonic, path)?)`.
@@ -173,5 +188,18 @@ mod tests {
         let auth = derive_keypair(&m, &DerivationPath::from_str("m/0'/0'").unwrap()).unwrap();
         let kem = derive_keypair(&m, &DerivationPath::from_str("m/1'/0'").unwrap()).unwrap();
         assert_ne!(auth.ml_dsa_pk(), kem.ml_dsa_pk());
+    }
+
+    #[test]
+    fn subkey_path_is_hardened_and_distinct() {
+        let m = mnemonic();
+        let a = derive_keypair(&m, &subkey_path(1, 0)).unwrap();
+        let b = derive_keypair(&m, &subkey_path(1, 1)).unwrap();
+        let c = derive_keypair(&m, &subkey_path(2, 0)).unwrap();
+        assert_ne!(a.ml_dsa_pk(), b.ml_dsa_pk(), "index must matter");
+        assert_ne!(a.ml_dsa_pk(), c.ml_dsa_pk(), "account must matter");
+        // Reproducible.
+        let a2 = derive_keypair(&m, &subkey_path(1, 0)).unwrap();
+        assert_eq!(a.ml_dsa_pk(), a2.ml_dsa_pk());
     }
 }
