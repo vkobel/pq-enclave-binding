@@ -217,8 +217,7 @@ fake by design.
 `pq-bundle` (v2 schema + the `verify()` security checks) ·
 `pq-quote` (parse/verify the COSE quote as of an instant) ·
 `pq-ots` (OpenTimestamps stamp + offline anchor verify) ·
-`pq-cli` (the `pq` binary). See [`demo-spec.md`](demo-spec.md) for the full
-soundness analysis.
+`pq-cli` (the `pq` binary).
 
 ### Subkeys
 

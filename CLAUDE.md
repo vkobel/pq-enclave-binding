@@ -9,11 +9,8 @@ immutable artifact proving a post-quantum keypair (ML-DSA-65 + SLH-DSA-SHAKE-128
 generated inside a specific AWS Nitro Enclave at a verifiable pre-Q-Day date. It is a
 one-time key burn-in ceremony, **not** a live RA-TLS flow.
 
-`demo-spec.md` is the design document and the source of truth for *why* each link in the
-chain exists and which checks are security-critical. Read it before changing
-cryptographic behavior. Note that several spec "Implementation note" callouts supersede
-the surrounding prose — the actual build uses `fips204`/`fips205` (not RustCrypto
-`ml-dsa`/`slh-dsa`) and the binary is `pq` (not `keyfork-*`).
+Note on implementation choices: the actual build uses `fips204`/`fips205` (not
+RustCrypto `ml-dsa`/`slh-dsa`) and the binary is `pq` (not `keyfork-*`).
 
 This is **not** a fork of keyfork and imports zero keyfork code. It rides RustCrypto's
 prerelease `signature` train indirectly via the COSE/X.509 stack, which is why crate
@@ -154,7 +151,7 @@ no-export design — i.e., by the enclave code never serializing the secret key.
 
 ### Security checks that must never be dropped
 
-`demo-spec.md` Phase 5 steps 3 and 4 (debug-mode rejection + PCR pinning) are
+Debug-mode rejection and PCR pinning are
 non-negotiable. Without them a valid AWS cert chain plus a matching `user_data` is
 satisfied by *any* enclave — including an attacker's. The verifier also cross-checks the
 pinned root CA's SHA-256 against the bundle's archived `aws_root_ca_sha256`.
