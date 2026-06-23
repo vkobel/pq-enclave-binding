@@ -945,6 +945,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pq-merkle"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "pq-ots"
 version = "0.1.0"
 dependencies = [

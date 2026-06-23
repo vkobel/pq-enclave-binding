@@ -10,6 +10,7 @@ members = [
     "crates/pq-ceremony",
     "crates/pq-subkey",
     "crates/pq-derive",
+    "crates/pq-merkle",
 ]
 
 [workspace.package]
