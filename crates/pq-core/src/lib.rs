@@ -175,6 +175,29 @@ pub fn canonical_payload(ml_dsa_pk: &[u8], slh_dsa_pk: &[u8]) -> Vec<u8> {
     v
 }
 
+/// The canonical payload that also commits to the subkey Merkle root:
+/// [`canonical_payload`] followed by a length-prefixed `subkey_merkle_root`.
+///
+/// This is what the enclave dual-signs and hashes into the NSM `user_data`, so
+/// the hardware attestation, the OTS anchor, and the PQ signatures all commit to
+/// the two root public keys *and* the bounded subkey set in one shot.
+///
+/// # Panics
+/// Panics if `subkey_merkle_root` is longer than `u32::MAX` (never the case: 32 bytes).
+#[must_use]
+pub fn canonical_payload_with_subkeys(
+    ml_dsa_pk: &[u8],
+    slh_dsa_pk: &[u8],
+    subkey_merkle_root: &[u8],
+) -> Vec<u8> {
+    let mut v = canonical_payload(ml_dsa_pk, slh_dsa_pk);
+    v.extend_from_slice(
+        &u32::try_from(subkey_merkle_root.len()).expect("root len fits u32").to_be_bytes(),
+    );
+    v.extend_from_slice(subkey_merkle_root);
+    v
+}
+
 /// Domain-separated 32-byte sub-seed: `SHA-256(domain || seed)`.
 fn derive_subseed(domain: &[u8], seed: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
@@ -312,5 +335,21 @@ mod tests {
         assert!(ud.len() <= 512);
         assert!(ud.starts_with(USER_DATA_PREFIX));
         assert_eq!(ud.len(), USER_DATA_PREFIX.len() + 32);
+    }
+
+    #[test]
+    fn payload_with_subkeys_extends_root_payload() {
+        let root = [0x55u8; 32];
+        let base = canonical_payload(b"ml", b"slh");
+        let full = canonical_payload_with_subkeys(b"ml", b"slh", &root);
+        assert!(full.starts_with(&base), "must extend the root-only payload");
+        assert!(full.len() > base.len());
+    }
+
+    #[test]
+    fn payload_with_subkeys_binds_the_root() {
+        let a = canonical_payload_with_subkeys(b"ml", b"slh", &[1u8; 32]);
+        let b = canonical_payload_with_subkeys(b"ml", b"slh", &[2u8; 32]);
+        assert_ne!(a, b, "different Merkle roots must give different payloads");
     }
 }
