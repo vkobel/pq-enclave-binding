@@ -208,14 +208,59 @@ fake by design.
 
 ### Crate layout
 
-`pq-core` (keygen + dual-sign, `canonical_payload`/`user_data_commitment`) ·
+`pq-core` (keygen + dual-sign, `canonical_payload`/`canonical_payload_with_subkeys`/`user_data_commitment`) ·
 `pq-enclave` (NSM behind an `Nsm` trait; `MockNsm` vs real `nitro`) ·
-`pq-ceremony` (the enclave binary; serves `bundle.json`) ·
-`pq-bundle` (schema + the `verify()` security checks) ·
+`pq-merkle` (subkey pre-commitment tree; `subkey_leaf`/`merkle_root`/`merkle_proof`/`verify_membership`) ·
+`pq-derive` (mnemonic → HD subkey derivation via keyfork/SLIP-0010) ·
+`pq-ceremony` (the enclave binary; serves `bundle.json` + signing oracle) ·
+`pq-bundle` (v2 schema + the `verify()` security checks) ·
 `pq-quote` (parse/verify the COSE quote as of an instant) ·
 `pq-ots` (OpenTimestamps stamp + offline anchor verify) ·
 `pq-cli` (the `pq` binary). See [`demo-spec.md`](demo-spec.md) for the full
 soundness analysis.
+
+### Subkeys
+
+The enclave pre-commits a bounded set of subkeys at ceremony time, so their
+birth-provenance is anchored in the same Bitcoin block as the root keys — no
+further interaction with the enclave is needed to prove they existed.
+
+**How many subkeys.** Set `PQ_SUBKEYS_AUTH` (Auth lane, default 4) and
+`PQ_SUBKEYS_ENC` (Encryption lane, default 0) before starting the ceremony. All
+subkeys are HD-derived from the same in-enclave mnemonic; their public keys are
+hashed into a Merkle tree whose root is folded into
+`canonical_payload_with_subkeys`, dual-signed, attested, and OTS-anchored.
+
+**Proving birth-provenance** (offline, no live enclave):
+
+```bash
+# Fetch the public key + Merkle proof for subkey 0:
+curl -s https://<your-domain>/subkey/0 > subkey.json
+
+# Verify that subkey 0 is committed in the anchored bundle:
+pq verify-subkey --bundle bundle.json --subkey subkey.json
+# ✓ birth-provenance — subkey #0 is committed in the enclave's anchored set
+```
+
+To also verify a signature produced by the enclave:
+
+```bash
+# Request a signature (message must be hex-encoded):
+curl -s -X POST https://<your-domain>/sign \
+  -H 'Content-Type: application/json' \
+  -d '{"index":0,"message_hex":"68656c6c6f"}' > signed.json
+
+pq verify-subkey --bundle bundle.json --subkey signed.json --message-hex 68656c6c6f
+# ✓ birth-provenance — subkey #0 is committed in the enclave's anchored set
+# ✓ authenticity — dual signature over the message verifies
+```
+
+The enclave re-derives the subkey on demand and signs in-process. **No secret
+is ever exported.**
+
+**Deferred export paths** (not built in this POC):
+- Shamir backup (`keyfork-shard`) for mnemonic recovery.
+- TEE-to-TEE migration (ML-KEM / `fips203` wrapping to a successor enclave).
 
 ### Why `pq stamp`, not `ots stamp`?
 
