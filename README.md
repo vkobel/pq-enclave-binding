@@ -27,8 +27,9 @@ A Nitro attestation quote is signed with AWS's **ECDSA P-384** PKI — which Sho
 algorithm breaks, so a quote alone is worthless after Q-Day. Three independently
 sound primitives are chained so the proof survives:
 
-1. **NSM quote** binds the enclave identity (PCR0/1/2) to the keys by embedding
-   `SHA-256(canonical_payload)` in the attestation's `user_data`.
+1. **NSM quote** binds the enclave identity (PCR0/1/2) to the keys (and the
+   pre-committed subkey set) by embedding
+   `SHA-256(canonical_payload_with_subkeys)` in the attestation's `user_data`.
 2. **OpenTimestamps** anchors the bundle in a Bitcoin block — a SHA-256 /
    proof-of-work timestamp with *no signatures*, so Shor gives no advantage. It
    proves the bundle existed *before* a block whose time is pre-Q-Day.
@@ -112,9 +113,9 @@ Verifying bundle.json ...
           PCR0 7712469de74e5f322f34095a9d080206aaf196e42822c43ea84cfecde21b21958abd471746dd29ad64c6aa12708f5a4c
           PCR1 7712469de74e5f322f34095a9d080206aaf196e42822c43ea84cfecde21b21958abd471746dd29ad64c6aa12708f5a4c
           PCR2 21b9efbc184807662e966d34f390821309eeac6802309798826296bf3e8bec7c10edb30948c90ba67310f7b964fc500a
-✓ [6/7] Key binding — quote.user_data == "pq-keyfork-v1:" || SHA-256(canonical_payload)
+✓ [6/7] Key binding — quote.user_data == "pq-keyfork-v1:" || SHA-256(canonical_payload_with_subkeys)
           user_data 70712d6b6579666f726b2d76313a740198ff6458e553b3244945992943664b1b795a4e51f9f63b1799146ae8d6e0
-✓ [7/7] Dual PQ signatures valid over canonical_payload
+✓ [7/7] Dual PQ signatures valid over canonical_payload_with_subkeys
           ML-DSA-65 pk 1952 B  +  SLH-DSA-SHAKE-128f pk 32 B
 
 VERIFIED — these PQ public keys were generated inside the attested
