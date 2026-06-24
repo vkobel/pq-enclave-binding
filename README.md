@@ -128,7 +128,7 @@ You provide `aws_nitro_root.der` out of band (see [Deploy](#deploy-on-caution));
 check `[2/7]` ties it to the bundle. `pq verify` never contacts the enclave and
 uses no nonce — it proves the keys existed in that enclave *before a Bitcoin
 block*, which is checkable forever. For a **live** liveness/freshness check of a
-running enclave, that's `caution verify` (next section), which issues a fresh
+running enclave, that's `caution verify` (step 6 below), which issues a fresh
 challenge nonce. The two are complementary.
 
 ### 4. Prove subkey birth-provenance — offline
@@ -177,6 +177,30 @@ VERIFIED — this subkey was generated inside the attested enclave.
 
 Once `bundle.json.ots` is upgraded, pass `--ots` / `--root` / `--esplora` to run
 all 9 checks (the 7 bundle checks + the 2 subkey checks) in one command.
+
+### 6. Live liveness check — caution verify
+
+`pq verify` proves the bundle artifact is sound. `caution verify` complements it by
+issuing a **fresh nonce** to the *running* enclave and checking the reproduced PCRs
+match — proving the enclave is live right now, not just that it ran once.
+
+Install the Caution CLI first if needed:
+**[Caution quickstart](https://docs.caution.co/quickstart/fully-managed/#what-you-need)**
+
+```console
+$ caution verify          # run from this repo (needs .caution/ from caution init)
+Challenge nonce (sent): d4d48e05...
+Remote PCR values (from deployed enclave):
+  PCR0: 7dd26d083ec6f58ce4429abe56ac343de5c96fdd191408f1968c0d8faf5e778706e7e279b48e573b357a06533aace897
+  PCR1: 7dd26d083ec6f58ce4429abe56ac343de5c96fdd191408f1968c0d8faf5e778706e7e279b48e573b357a06533aace897
+  PCR2: 21b9efbc184807662e966d34f390821309eeac6802309798826296bf3e8bec7c10edb30948c90ba67310f7b964fc500a
+✓ Nonce verified (prevents replay attacks)
+✓ PCR values match expected
+✓ Attestation verification PASSED
+```
+
+Those PCRs are identical to `expected_pcrs` from `pq inspect` (step 1) — the
+reproducible build *is* the measurement `pq verify` pins against.
 
 > Offline header source: pass `--headers headers.json`
 > (`{"<height>":{"merkle_root":"<internal-hex>","time":<unix>}}`) instead of
@@ -232,8 +256,9 @@ enclave with a fresh nonce and a reproduced build; `pq verify` checks the durabl
 $ caution verify          # run from the deployment directory
 Challenge nonce (sent): d4d48e05...
 Remote PCR values (from deployed enclave):
-  PCR0: 7712469de74e5f322f34095a9d080206aaf196e42822c43ea84cfecde21b21958abd471746dd29ad64c6aa12708f5a4c
-  ...
+  PCR0: 7dd26d083ec6f58ce4429abe56ac343de5c96fdd191408f1968c0d8faf5e778706e7e279b48e573b357a06533aace897
+  PCR1: 7dd26d083ec6f58ce4429abe56ac343de5c96fdd191408f1968c0d8faf5e778706e7e279b48e573b357a06533aace897
+  PCR2: 21b9efbc184807662e966d34f390821309eeac6802309798826296bf3e8bec7c10edb30948c90ba67310f7b964fc500a
 ✓ Nonce verified (prevents replay attacks)
 ✓ PCR values match expected
 ✓ Attestation verification PASSED
