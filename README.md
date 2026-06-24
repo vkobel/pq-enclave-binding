@@ -304,8 +304,7 @@ Subkey birth-provenance and the signing oracle are demonstrated in steps 4–5 o
 the ceremony. All subkeys are HD-derived from the same in-enclave mnemonic at
 `m/1'/0'`…`m/1'/<N-1>'`; their public keys are hashed into a Merkle tree whose root
 is folded into `canonical_payload_with_subkeys`, dual-signed, attested, and
-OTS-anchored. (`PQ_SUBKEYS_ENC` reserves a second lane at `m/2'/...` for future use;
-leave it at 0 for now.)
+OTS-anchored.
 
 **Dual signing.** `POST /sign` produces two independent signatures over the same
 message — one ML-DSA-65 (lattice) and one SLH-DSA-SHAKE-128f (hash-based). Both are

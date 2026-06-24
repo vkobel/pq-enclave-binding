@@ -70,15 +70,17 @@ Crate dependency order (leaf → root):
 - **`pq-derive`** — mnemonic → hierarchical subkey derivation via keyfork's
   SLIP-0010 tree. `derive_keypair(mnemonic, path)` returns a `PqRootKeypair`
   deterministically from a BIP-39 mnemonic and a derivation path (e.g.
-  `m/0'/0'` for root, `m/1'/<i>'` for Auth subkeys, `m/2'/<i>'` for Encryption).
+  `m/0'/0'` for root, `m/1'/<i>'` for Auth subkeys; `m/2'/<i>'` is a reserved
+  scaffold lane for future use).
 - **`pq-subkey`** — cert-based delegation (root signs a subkey's public key in
   an X.509-style certificate). Built but **unused in the POC**: membership-proof
   birth-provenance (Merkle path against the anchored root) replaces it here.
   Present for completeness; cert delegation is a deferred integration path.
 - **`pq-ceremony`** — the enclave **binary**. `run_ceremony()` (lib, testable with
   `MockNsm`) does the one-shot burn-in: generate a mnemonic from in-enclave
-  entropy → HD-derive root keypair (`m/0'/0'`) + N Auth and M Encryption
-  subkeys → build a Merkle tree over all subkeys → fold the root into
+  entropy → HD-derive root keypair (`m/0'/0'`) + N Auth subkeys (a reserved
+  account-2 scaffold lane exists but is empty by default) → build a Merkle tree
+  over all subkeys → fold the root into
   `canonical_payload_with_subkeys` → dual-sign → NSM attest → self-read
   PCR0/1/2 → compose `PqRootBundle` (v2, includes `subkey_merkle_root` /
   `subkey_count`). `CeremonyConfig` controls `auth_count` / `enc_count` (from

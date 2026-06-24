@@ -4,8 +4,9 @@
 //! [`run_ceremony`] performs the one-shot flow from the demo spec:
 //!
 //! 1. Generate a mnemonic from in-enclave entropy and HD-derive the root keypair
-//!    at `m/0'/0'` plus N subkeys across Auth (account 1, `m/1'/0'`…`m/1'/<N-1>'`)
-//!    and Encryption (account 2, `m/2'/0'`…`m/2'/<M-1>'`) lanes.
+//!    at `m/0'/0'` plus N Auth subkeys (account 1, `m/1'/0'`…`m/1'/<N-1>'`).
+//!    A second derivation lane (account 2) is reserved scaffold for future use
+//!    and is empty by default.
 //! 2. Build a Merkle tree over the subkeys and fold the root into the payload.
 //! 3. Dual-sign the payload (`canonical_payload_with_subkeys`) with the root key.
 //! 4. Request an NSM attestation document whose `user_data` commits to that
@@ -41,7 +42,7 @@ pub enum CeremonyError {
 pub struct CeremonyConfig {
     /// Number of Auth (`account` 1) subkeys.
     pub auth_count: u32,
-    /// Number of Encryption (`account` 2) subkeys.
+    /// Reserved second lane (`account` 2) — scaffold for future use; keep at 0.
     pub enc_count: u32,
 }
 
@@ -50,11 +51,11 @@ pub struct CeremonyConfig {
 pub struct SubkeyRecord {
     /// Position in the flat Merkle leaf order.
     pub global_index: u32,
-    /// Derivation account/purpose lane (1 = Auth, 2 = Encryption).
+    /// Derivation account/purpose lane (1 = Auth; 2 = reserved scaffold).
     pub account: u32,
     /// Index within the lane.
     pub account_index: u32,
-    /// Purpose tag committed into the leaf (1 = Auth, 2 = Encryption).
+    /// Purpose tag committed into the leaf (1 = Auth; 2 = reserved scaffold).
     pub purpose_tag: u8,
     /// Subkey ML-DSA-65 public key.
     pub ml_dsa_pk: Vec<u8>,
@@ -124,7 +125,8 @@ pub fn run_ceremony(
     let ml_pk = root.ml_dsa_pk();
     let slh_pk = root.slh_dsa_pk();
 
-    // Derive subkeys: Auth lane (account 1) then Encryption lane (account 2).
+    // Derive subkeys: Auth lane (account 1), then the reserved scaffold lane
+    // (account 2), which is empty unless enc_count is set.
     let mut subkeys = Vec::new();
     let mut leaves = Vec::new();
     let mut global_index = 0u32;

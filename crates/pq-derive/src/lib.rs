@@ -121,7 +121,7 @@ pub fn derive_node(mnemonic: &Mnemonic, path: &DerivationPath) -> Result<[u8; 32
 
 /// Build the hardened subkey path `m/account'/index'`.
 ///
-/// `account` is the purpose lane (1 = Auth, 2 = Encryption by convention);
+/// `account` is the purpose lane (1 = Auth; 2 = reserved scaffold for future use);
 /// `index` enumerates subkeys within that lane.
 ///
 /// # Panics
