@@ -27,8 +27,9 @@ A Nitro attestation quote is signed with AWS's **ECDSA P-384** PKI — which Sho
 algorithm breaks, so a quote alone is worthless after Q-Day. Three independently
 sound primitives are chained so the proof survives:
 
-1. **NSM quote** binds the enclave identity (PCR0/1/2) to the keys by embedding
-   `SHA-256(canonical_payload)` in the attestation's `user_data`.
+1. **NSM quote** binds the enclave identity (PCR0/1/2) to the keys (and the
+   pre-committed subkey set) by embedding
+   `SHA-256(canonical_payload_with_subkeys)` in the attestation's `user_data`.
 2. **OpenTimestamps** anchors the bundle in a Bitcoin block — a SHA-256 /
    proof-of-work timestamp with *no signatures*, so Shor gives no advantage. It
    proves the bundle existed *before* a block whose time is pre-Q-Day.
@@ -58,15 +59,17 @@ cargo build -p pq-cli      # builds ./target/debug/pq
 $ curl -s https://pq-ceremony.kobl.one/bundle.json > bundle.json
 
 $ ./target/debug/pq inspect --bundle bundle.json
-bundle version:      1
+bundle version:      2
 ml-dsa-65 pk:        1952 bytes
 slh-dsa-128f pk:     32 bytes
-nsm quote:           4509 bytes (COSE_Sign1)
+nsm quote:           4508 bytes (COSE_Sign1)
 aws root ca sha256:  641a0321a3e244efe456463195d606317ed7cdcc3c1756e09893f3c68f79bb5b
-expected PCR0:       7712469de74e5f322f34095a9d080206aaf196e42822c43ea84cfecde21b21958abd471746dd29ad64c6aa12708f5a4c
-expected PCR1:       7712469de74e5f322f34095a9d080206aaf196e42822c43ea84cfecde21b21958abd471746dd29ad64c6aa12708f5a4c
+expected PCR0:       7dd26d083ec6f58ce4429abe56ac343de5c96fdd191408f1968c0d8faf5e778706e7e279b48e573b357a06533aace897
+expected PCR1:       7dd26d083ec6f58ce4429abe56ac343de5c96fdd191408f1968c0d8faf5e778706e7e279b48e573b357a06533aace897
 expected PCR2:       21b9efbc184807662e966d34f390821309eeac6802309798826296bf3e8bec7c10edb30948c90ba67310f7b964fc500a
-digest (sha256):     d2839421d6cc74e7a96ae6b37a9d168019c18ae4edd393a7b2a0656f854fda1c
+subkey merkle root:  18c03335fe2a0ce20e64ea3c9b459b88a2695fa65cd8832108f3284981868808
+subkey count:        4
+digest (sha256):     cdca69ba14ef217d40e24d5ed4aa6373ad31a0593edfff689ab165cbab3eed8e
 ```
 
 ### 2. Timestamp it, then upgrade once anchored
@@ -101,7 +104,7 @@ $ ./target/debug/pq verify --bundle bundle.json --ots bundle.json.ots \
 Verifying bundle.json ...
 
 ✓ [1/7] OTS timestamp — bundle digest committed to Bitcoin
-          digest d2839421d6cc74e7a96ae6b37a9d168019c18ae4edd393a7b2a0656f854fda1c
+          digest cdca69ba14ef217d40e24d5ed4aa6373ad31a0593edfff689ab165cbab3eed8e
           anchored in block 954272 (time: unix 1781799289)
 ✓ [2/7] Pinned AWS root CA matches the bundle
           sha256 641a0321a3e244efe456463195d606317ed7cdcc3c1756e09893f3c68f79bb5b
@@ -109,12 +112,12 @@ Verifying bundle.json ...
           to the pinned root, as of unix 1781799289 (anchor block time)
 ✓ [4/7] Debug-mode rejected — PCR0/1/2 are not all-zero
 ✓ [5/7] PCR pinning — quote PCR0/1/2 == bundle.expected_pcrs
-          PCR0 7712469de74e5f322f34095a9d080206aaf196e42822c43ea84cfecde21b21958abd471746dd29ad64c6aa12708f5a4c
-          PCR1 7712469de74e5f322f34095a9d080206aaf196e42822c43ea84cfecde21b21958abd471746dd29ad64c6aa12708f5a4c
+          PCR0 7dd26d083ec6f58ce4429abe56ac343de5c96fdd191408f1968c0d8faf5e778706e7e279b48e573b357a06533aace897
+          PCR1 7dd26d083ec6f58ce4429abe56ac343de5c96fdd191408f1968c0d8faf5e778706e7e279b48e573b357a06533aace897
           PCR2 21b9efbc184807662e966d34f390821309eeac6802309798826296bf3e8bec7c10edb30948c90ba67310f7b964fc500a
-✓ [6/7] Key binding — quote.user_data == "pq-keyfork-v1:" || SHA-256(canonical_payload)
-          user_data 70712d6b6579666f726b2d76313a740198ff6458e553b3244945992943664b1b795a4e51f9f63b1799146ae8d6e0
-✓ [7/7] Dual PQ signatures valid over canonical_payload
+✓ [6/7] Key binding — quote.user_data == "pq-keyfork-v1:" || SHA-256(canonical_payload_with_subkeys)
+          user_data 70712d6b6579666f726b2d76313aa7f12669896fabff3a24f8eabed87bd5294b5b5afff22eef34b2e128a503c41c
+✓ [7/7] Dual PQ signatures valid over canonical_payload_with_subkeys
           ML-DSA-65 pk 1952 B  +  SLH-DSA-SHAKE-128f pk 32 B
 
 VERIFIED — these PQ public keys were generated inside the attested
@@ -125,8 +128,79 @@ You provide `aws_nitro_root.der` out of band (see [Deploy](#deploy-on-caution));
 check `[2/7]` ties it to the bundle. `pq verify` never contacts the enclave and
 uses no nonce — it proves the keys existed in that enclave *before a Bitcoin
 block*, which is checkable forever. For a **live** liveness/freshness check of a
-running enclave, that's `caution verify` (next section), which issues a fresh
+running enclave, that's `caution verify` (step 6 below), which issues a fresh
 challenge nonce. The two are complementary.
+
+### 4. Prove subkey birth-provenance — offline
+
+The `inspect` output shows 4 pre-committed subkeys. To list them all:
+
+```console
+$ curl -s https://pq-ceremony.kobl.one/subkeys | python3 -m json.tool | grep index
+        "index": 0,
+        "index": 1,
+        "index": 2,
+        "index": 3,
+```
+
+Subkeys are Auth lane (purpose tag 1), derived at `m/1'/0'`…`m/1'/3'`. To verify
+birth-provenance for one — no live enclave needed:
+
+```console
+$ curl -s https://pq-ceremony.kobl.one/subkey/0 > subkey.json
+
+$ ./target/debug/pq verify-subkey --bundle bundle.json --subkey subkey.json
+✓ [1/1] Birth-provenance — subkey #0 is committed in the enclave's anchored set
+
+VERIFIED — this subkey was generated inside the attested enclave.
+```
+
+### 5. Sign with a subkey — oracle round-trip
+
+`POST /sign` re-derives the subkey in-enclave and signs with **both** ML-DSA-65
+and SLH-DSA-SHAKE-128f (the same dual-algorithm approach as the root key). The
+private key never leaves the enclave; the response contains both signatures plus
+the Merkle membership proof.
+
+```console
+$ curl -s -X POST https://pq-ceremony.kobl.one/sign \
+    -H 'Content-Type: application/json' \
+    -d '{"index":0,"message_hex":"68656c6c6f"}' > signed.json
+
+$ ./target/debug/pq verify-subkey --bundle bundle.json --subkey signed.json \
+    --message-hex 68656c6c6f
+✓ [1/2] Birth-provenance — subkey #0 is committed in the enclave's anchored set
+✓ [2/2] Authenticity — dual signature over the message verifies
+
+VERIFIED — this subkey was generated inside the attested enclave.
+```
+
+Once `bundle.json.ots` is upgraded, pass `--ots` / `--root` / `--esplora` to run
+all 9 checks (the 7 bundle checks + the 2 subkey checks) in one command.
+
+### 6. Live liveness check — caution verify
+
+`pq verify` proves the bundle artifact is sound. `caution verify` complements it by
+issuing a **fresh nonce** to the *running* enclave and checking the reproduced PCRs
+match — proving the enclave is live right now, not just that it ran once.
+
+Install the Caution CLI first if needed:
+**[Caution quickstart](https://docs.caution.co/quickstart/fully-managed/#what-you-need)**
+
+```console
+$ caution verify          # run from this repo (needs .caution/ from caution init)
+Challenge nonce (sent): d4d48e05...
+Remote PCR values (from deployed enclave):
+  PCR0: 7dd26d083ec6f58ce4429abe56ac343de5c96fdd191408f1968c0d8faf5e778706e7e279b48e573b357a06533aace897
+  PCR1: 7dd26d083ec6f58ce4429abe56ac343de5c96fdd191408f1968c0d8faf5e778706e7e279b48e573b357a06533aace897
+  PCR2: 21b9efbc184807662e966d34f390821309eeac6802309798826296bf3e8bec7c10edb30948c90ba67310f7b964fc500a
+✓ Nonce verified (prevents replay attacks)
+✓ PCR values match expected
+✓ Attestation verification PASSED
+```
+
+Those PCRs are identical to `expected_pcrs` from `pq inspect` (step 1) — the
+reproducible build *is* the measurement `pq verify` pins against.
 
 > Offline header source: pass `--headers headers.json`
 > (`{"<height>":{"merkle_root":"<internal-hex>","time":<unix>}}`) instead of
@@ -153,7 +227,9 @@ openssl x509 -in aws_nitro_root.der -inform der -noout -fingerprint -sha256
 ```
 
 The `Containerfile` pins `stagex/pallet-rust` by digest; refresh it when bumping
-StageX. Set a real `domain` (and `app_sources`) in `Procfile`.
+StageX. Set a real `domain` (and `app_sources`) in `Procfile`. `PQ_SUBKEYS_AUTH`
+controls how many Auth subkeys the ceremony generates (default 4; the live demo uses
+30 — set in `Procfile` as `PQ_SUBKEYS_AUTH=30 /app/pq-ceremony ...`).
 
 **2. Deploy.**
 
@@ -180,8 +256,9 @@ enclave with a fresh nonce and a reproduced build; `pq verify` checks the durabl
 $ caution verify          # run from the deployment directory
 Challenge nonce (sent): d4d48e05...
 Remote PCR values (from deployed enclave):
-  PCR0: 7712469de74e5f322f34095a9d080206aaf196e42822c43ea84cfecde21b21958abd471746dd29ad64c6aa12708f5a4c
-  ...
+  PCR0: 7dd26d083ec6f58ce4429abe56ac343de5c96fdd191408f1968c0d8faf5e778706e7e279b48e573b357a06533aace897
+  PCR1: 7dd26d083ec6f58ce4429abe56ac343de5c96fdd191408f1968c0d8faf5e778706e7e279b48e573b357a06533aace897
+  PCR2: 21b9efbc184807662e966d34f390821309eeac6802309798826296bf3e8bec7c10edb30948c90ba67310f7b964fc500a
 ✓ Nonce verified (prevents replay attacks)
 ✓ PCR values match expected
 ✓ Attestation verification PASSED
@@ -208,14 +285,39 @@ fake by design.
 
 ### Crate layout
 
-`pq-core` (keygen + dual-sign, `canonical_payload`/`user_data_commitment`) ·
+`pq-core` (keygen + dual-sign, `canonical_payload`/`canonical_payload_with_subkeys`/`user_data_commitment`) ·
 `pq-enclave` (NSM behind an `Nsm` trait; `MockNsm` vs real `nitro`) ·
-`pq-ceremony` (the enclave binary; serves `bundle.json`) ·
-`pq-bundle` (schema + the `verify()` security checks) ·
+`pq-merkle` (subkey pre-commitment tree; `subkey_leaf`/`merkle_root`/`merkle_proof`/`verify_membership`) ·
+`pq-derive` (mnemonic → HD subkey derivation via keyfork/SLIP-0010) ·
+`pq-ceremony` (the enclave binary; serves `bundle.json` + signing oracle) ·
+`pq-bundle` (v2 schema + the `verify()` security checks) ·
 `pq-quote` (parse/verify the COSE quote as of an instant) ·
 `pq-ots` (OpenTimestamps stamp + offline anchor verify) ·
-`pq-cli` (the `pq` binary). See [`demo-spec.md`](demo-spec.md) for the full
-soundness analysis.
+`pq-cli` (the `pq` binary).
+
+### Subkeys
+
+Subkey birth-provenance and the signing oracle are demonstrated in steps 4–5 of
+[Try it](#try-it) above.
+
+**How many subkeys.** Set `PQ_SUBKEYS_AUTH` (Auth lane, default 4) before starting
+the ceremony. All subkeys are HD-derived from the same in-enclave mnemonic at
+`m/1'/0'`…`m/1'/<N-1>'`; their public keys are hashed into a Merkle tree whose root
+is folded into `canonical_payload_with_subkeys`, dual-signed, attested, and
+OTS-anchored.
+
+**Dual signing.** `POST /sign` produces two independent signatures over the same
+message — one ML-DSA-65 (lattice) and one SLH-DSA-SHAKE-128f (hash-based). Both are
+returned in the response and both are verified by `pq verify-subkey`. This mirrors the
+root key design: a break of one algorithm family leaves the other intact.
+
+**Discovering subkey indices.** `GET /subkeys` returns all pre-committed subkeys with
+their purpose tag (`1` = Auth), public keys, and Merkle proofs. Use this to enumerate
+available indices before calling `/subkey/<i>` or `POST /sign`.
+
+**Deferred export paths** (not built in this POC):
+- Shamir backup (`keyfork-shard`) for mnemonic recovery.
+- TEE-to-TEE migration (ML-KEM / `fips203` wrapping to a successor enclave).
 
 ### Why `pq stamp`, not `ots stamp`?
 

@@ -13,6 +13,11 @@ path = "src/main.rs"
 pq-core = { path = "../pq-core" }
 pq-enclave = { path = "../pq-enclave" }
 pq-bundle = { path = "../pq-bundle" }
+pq-derive = { path = "../pq-derive" }
+pq-merkle = { path = "../pq-merkle" }
+keyfork-mnemonic = { version = "0.4", registry = "distrust", default-features = false }
+getrandom = "0.2"
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

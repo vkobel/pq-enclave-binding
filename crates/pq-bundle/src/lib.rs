@@ -13,13 +13,13 @@
 //! 1. **Debug-mode rejection** — PCR0/1/2 must not all be zero.
 //! 2. **PCR pinning** — PCR0/1/2 from the quote must equal the values stored in
 //!    the bundle's `expected_pcrs`.
-//! 3. **Binding** — `quote.user_data` must equal
-//!    `USER_DATA_PREFIX || SHA-256(canonical_payload(ml_dsa_pk, slh_dsa_pk))`.
+//! 3. **Binding** — `quote.user_data` must equal `USER_DATA_PREFIX ||
+//!    SHA-256(canonical_payload_with_subkeys(ml_dsa_pk, slh_dsa_pk, subkey_merkle_root))`.
 //! 4. **Dual PQ signature** — both ML-DSA and SLH-DSA signatures over
-//!    `canonical_payload` must verify.
+//!    `canonical_payload_with_subkeys` must verify.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use pq_core::{canonical_payload, user_data_commitment, verify_dual, DualSignature};
+use pq_core::{canonical_payload_with_subkeys, user_data_commitment, verify_dual, DualSignature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -101,12 +101,16 @@ pub struct VerifyReport {
     pub pcr1: Vec<u8>,
     /// Quote PCR2 — equal to `bundle.expected_pcrs.pcr2`.
     pub pcr2: Vec<u8>,
-    /// The quote's `user_data` — equal to `user_data_commitment(canonical_payload)`.
+    /// The quote's `user_data` — equal to `user_data_commitment(canonical_payload_with_subkeys)`.
     pub user_data: Vec<u8>,
     /// Length of the ML-DSA-65 public key whose signature verified.
     pub ml_dsa_pk_len: usize,
     /// Length of the SLH-DSA-SHAKE-128f public key whose signature verified.
     pub slh_dsa_pk_len: usize,
+    /// The subkey Merkle root that was committed (decoded bytes).
+    pub subkey_merkle_root: Vec<u8>,
+    /// Number of pre-committed subkeys.
+    pub subkey_count: u32,
 }
 
 /// Abstracts NSM quote parsing and signature verification.
@@ -165,7 +169,7 @@ pub struct ExpectedPcrs {
 /// - signatures: **hex**
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PqRootBundle {
-    /// Schema version (currently `"1"`).
+    /// Schema version (currently `"2"`).
     pub version: String,
     /// ML-DSA-65 public key, hex-encoded.
     pub ml_dsa_pk: String,
@@ -178,9 +182,14 @@ pub struct PqRootBundle {
     pub aws_root_ca_sha256: String,
     /// PCR0/1/2 values from the reproducible build, for the record.
     pub expected_pcrs: ExpectedPcrs,
-    /// ML-DSA-65 signature over `canonical_payload(ml_dsa_pk, slh_dsa_pk)`, hex-encoded.
+    /// Merkle root over the bounded set of pre-committed subkey public keys,
+    /// hex-encoded. Folded into the signed/attested/anchored canonical payload.
+    pub subkey_merkle_root: String,
+    /// Number of leaves in the subkey Merkle tree.
+    pub subkey_count: u32,
+    /// ML-DSA-65 signature over `canonical_payload_with_subkeys(ml_dsa_pk, slh_dsa_pk, subkey_merkle_root)`, hex-encoded.
     pub ml_dsa_sig: String,
-    /// SLH-DSA-SHAKE-128f signature over `canonical_payload(ml_dsa_pk, slh_dsa_pk)`, hex-encoded.
+    /// SLH-DSA-SHAKE-128f signature over `canonical_payload_with_subkeys(ml_dsa_pk, slh_dsa_pk, subkey_merkle_root)`, hex-encoded.
     pub slh_dsa_sig: String,
 }
 
@@ -216,8 +225,8 @@ impl PqRootBundle {
 /// 1. Decode the NSM quote (base64) and call `quote_verifier.verify_quote`.
 /// 2. **Debug-mode rejection**: fail if PCR0, PCR1, and PCR2 are all-zero.
 /// 3. **PCR pinning**: quote PCR0/1/2 must match `bundle.expected_pcrs`.
-/// 4. **Binding**: `quote.user_data == USER_DATA_PREFIX || SHA-256(canonical_payload)`.
-/// 5. **Dual PQ signature**: ML-DSA + SLH-DSA over `canonical_payload`.
+/// 4. **Binding**: `quote.user_data == USER_DATA_PREFIX || SHA-256(canonical_payload_with_subkeys)`.
+/// 5. **Dual PQ signature**: ML-DSA + SLH-DSA over `canonical_payload_with_subkeys`.
 ///
 /// If `ts_verifier` and `ots_bytes` are both `Some`, step 0 additionally
 /// verifies the OTS timestamp proof.
@@ -290,8 +299,13 @@ pub fn verify(
     check_pcr(1, &bundle.expected_pcrs.pcr1, &quote_data.pcr1)?;
     check_pcr(2, &bundle.expected_pcrs.pcr2, &quote_data.pcr2)?;
 
-    // ── Step 4: Binding check ────────────────────────────────────────────────
-    let payload = canonical_payload(&ml_pk, &slh_pk);
+    let subkey_root = hex::decode(&bundle.subkey_merkle_root).map_err(|e| Error::HexDecode {
+        field: "subkey_merkle_root",
+        source: e,
+    })?;
+
+    // ── Step 4: Binding check (root keys + subkey set: root and count) ───────
+    let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, bundle.subkey_count);
     let expected_user_data = user_data_commitment(&payload);
     if quote_data.user_data != expected_user_data {
         return Err(Error::BindingMismatch);
@@ -311,6 +325,8 @@ pub fn verify(
         user_data: quote_data.user_data,
         ml_dsa_pk_len: ml_pk.len(),
         slh_dsa_pk_len: slh_pk.len(),
+        subkey_merkle_root: subkey_root,
+        subkey_count: bundle.subkey_count,
     })
 }
 
@@ -319,7 +335,10 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pq_core::{canonical_payload, user_data_commitment, PqRootKeypair, USER_DATA_PREFIX};
+    use pq_core::{
+        canonical_payload, canonical_payload_with_subkeys, user_data_commitment, PqRootKeypair,
+        USER_DATA_PREFIX,
+    };
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -371,7 +390,12 @@ mod tests {
         let kp = PqRootKeypair::generate();
         let ml_pk = kp.ml_dsa_pk();
         let slh_pk = kp.slh_dsa_pk();
-        let payload = canonical_payload(&ml_pk, &slh_pk);
+
+        // A minimal one-subkey tree so the bundle is internally consistent.
+        let leaf = pq_merkle::subkey_leaf(0, 1, &ml_pk, &slh_pk);
+        let subkey_root = pq_merkle::merkle_root(&[leaf]);
+
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, 1);
         let sig = kp.sign_payload(&payload);
 
         let pcr0 = sample_pcr(0x11);
@@ -379,7 +403,7 @@ mod tests {
         let pcr2 = sample_pcr(0x33);
 
         let bundle = PqRootBundle {
-            version: "1".to_owned(),
+            version: "2".to_owned(),
             ml_dsa_pk: hex::encode(&ml_pk),
             slh_dsa_pk: hex::encode(&slh_pk),
             nsm_quote: BASE64.encode(b"dummy-quote"),
@@ -389,6 +413,8 @@ mod tests {
                 pcr1: hex::encode(&pcr1),
                 pcr2: hex::encode(&pcr2),
             },
+            subkey_merkle_root: hex::encode(subkey_root),
+            subkey_count: 1,
             ml_dsa_sig: hex::encode(&sig.ml_dsa),
             slh_dsa_sig: hex::encode(&sig.slh_dsa),
         };
@@ -404,7 +430,8 @@ mod tests {
 
         let ml_pk = hex::decode(&bundle.ml_dsa_pk).unwrap();
         let slh_pk = hex::decode(&bundle.slh_dsa_pk).unwrap();
-        let payload = canonical_payload(&ml_pk, &slh_pk);
+        let subkey_root = hex::decode(&bundle.subkey_merkle_root).unwrap();
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, bundle.subkey_count);
         let user_data = user_data_commitment(&payload);
 
         let verifier = MockQuoteVerifier::good(pcr0, pcr1, pcr2, user_data);
@@ -418,7 +445,8 @@ mod tests {
         // Override user_data to the correct commitment so only the PCR check triggers.
         let ml_pk = hex::decode(&bundle.ml_dsa_pk).unwrap();
         let slh_pk = hex::decode(&bundle.slh_dsa_pk).unwrap();
-        let payload = canonical_payload(&ml_pk, &slh_pk);
+        let subkey_root = hex::decode(&bundle.subkey_merkle_root).unwrap();
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, bundle.subkey_count);
         let user_data = user_data_commitment(&payload);
 
         let verifier =
@@ -436,7 +464,8 @@ mod tests {
 
         let ml_pk = hex::decode(&bundle.ml_dsa_pk).unwrap();
         let slh_pk = hex::decode(&bundle.slh_dsa_pk).unwrap();
-        let payload = canonical_payload(&ml_pk, &slh_pk);
+        let subkey_root = hex::decode(&bundle.subkey_merkle_root).unwrap();
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, bundle.subkey_count);
         let user_data = user_data_commitment(&payload);
 
         // Provide a wrong PCR2
@@ -475,7 +504,8 @@ mod tests {
 
         let ml_pk = hex::decode(&bundle.ml_dsa_pk).unwrap();
         let slh_pk = hex::decode(&bundle.slh_dsa_pk).unwrap();
-        let payload = canonical_payload(&ml_pk, &slh_pk);
+        let subkey_root = hex::decode(&bundle.subkey_merkle_root).unwrap();
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, bundle.subkey_count);
         let user_data = user_data_commitment(&payload);
 
         let verifier = MockQuoteVerifier::good(pcr0, pcr1, pcr2, user_data);
@@ -513,5 +543,42 @@ mod tests {
             matches!(err, Error::QuoteParse(_)),
             "expected QuoteParse error, got: {err}"
         );
+    }
+
+    #[test]
+    fn tampered_subkey_root_rejected() {
+        let (mut bundle, pcr0, pcr1, pcr2) = make_valid_bundle();
+
+        // Flip the committed Merkle root; the recomputed user_data no longer matches.
+        bundle.subkey_merkle_root = hex::encode([0xaau8; 32]);
+
+        let ml_pk = hex::decode(&bundle.ml_dsa_pk).unwrap();
+        let slh_pk = hex::decode(&bundle.slh_dsa_pk).unwrap();
+        // user_data still commits to the *original* root, so binding fails.
+        let original_root = pq_merkle::merkle_root(&[pq_merkle::subkey_leaf(0, 1, &ml_pk, &slh_pk)]);
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &original_root, bundle.subkey_count);
+        let user_data = user_data_commitment(&payload);
+
+        let verifier = MockQuoteVerifier::good(pcr0, pcr1, pcr2, user_data);
+        let err = verify(&bundle, &verifier, None).unwrap_err();
+        assert!(matches!(err, Error::BindingMismatch), "expected BindingMismatch, got: {err}");
+    }
+
+    #[test]
+    fn tampered_subkey_count_rejected() {
+        let (mut bundle, pcr0, pcr1, pcr2) = make_valid_bundle();
+
+        // user_data commits to the original count (1); bump it without re-signing.
+        let ml_pk = hex::decode(&bundle.ml_dsa_pk).unwrap();
+        let slh_pk = hex::decode(&bundle.slh_dsa_pk).unwrap();
+        let subkey_root = hex::decode(&bundle.subkey_merkle_root).unwrap();
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, 1);
+        let user_data = user_data_commitment(&payload);
+
+        bundle.subkey_count = 99;
+
+        let verifier = MockQuoteVerifier::good(pcr0, pcr1, pcr2, user_data);
+        let err = verify(&bundle, &verifier, None).unwrap_err();
+        assert!(matches!(err, Error::BindingMismatch), "expected BindingMismatch, got: {err}");
     }
 }

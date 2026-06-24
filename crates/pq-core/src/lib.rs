@@ -25,11 +25,13 @@
 
 use fips204::ml_dsa_65;
 use fips205::slh_dsa_shake_128f;
+use rand_chacha::rand_core::SeedableRng as _;
+use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
 
 // Both crates expose same-named traits; import anonymously so the methods are in
 // scope without the trait names colliding.
-use fips204::traits::{SerDes as _, Signer as _, Verifier as _};
+use fips204::traits::{KeyGen as _, SerDes as _, Signer as _, Verifier as _};
 use fips205::traits::{SerDes as _, Signer as _, Verifier as _};
 
 /// Version tag prepended to the NSM `user_data` commitment, for future-proofing.
@@ -79,6 +81,38 @@ impl PqRootKeypair {
         let (ml_pk, ml_dsa_sk) = ml_dsa_65::try_keygen().expect("ML-DSA-65 key generation");
         let (slh_pk, slh_dsa_sk) =
             slh_dsa_shake_128f::try_keygen().expect("SLH-DSA-SHAKE-128f key generation");
+        Self {
+            ml_dsa_pk: ml_pk.into_bytes().to_vec(),
+            slh_dsa_pk: slh_pk.into_bytes().to_vec(),
+            ml_dsa_sk,
+            slh_dsa_sk,
+        }
+    }
+
+    /// Deterministically generate the keypair from a 32-byte `seed` (e.g. a node
+    /// derived by keyfork's SLIP-0010 tree). The same seed always yields the same
+    /// keypair, enabling mnemonic backup and hierarchical subkey derivation.
+    ///
+    /// The seed is domain-separated per algorithm before expansion, so the two
+    /// keys never share input material:
+    /// - ML-DSA-65 uses `SHA-256("…ml-dsa…" || seed)` directly as the FIPS 204 ξ.
+    /// - SLH-DSA seeds a `ChaCha20` CSPRNG from `SHA-256("…slh-dsa…" || seed)`,
+    ///   which feeds FIPS 205 key generation (it draws its 3·n seed bytes in the
+    ///   standard order, so the result is reproducible for a pinned `fips205`).
+    ///
+    /// # Panics
+    /// Panics if SLH-DSA key generation fails (treated as infallible here, since
+    /// the RNG is a deterministic in-memory `ChaCha20`).
+    #[must_use]
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        let ml_xi = derive_subseed(b"pq-root-ml-dsa-v1", seed);
+        let (ml_pk, ml_dsa_sk) = ml_dsa_65::KG::keygen_from_seed(&ml_xi);
+
+        let slh_seed = derive_subseed(b"pq-root-slh-dsa-v1", seed);
+        let mut rng = ChaCha20Rng::from_seed(slh_seed);
+        let (slh_pk, slh_dsa_sk) = slh_dsa_shake_128f::try_keygen_with_rng(&mut rng)
+            .expect("SLH-DSA-SHAKE-128f key generation");
+
         Self {
             ml_dsa_pk: ml_pk.into_bytes().to_vec(),
             slh_dsa_pk: slh_pk.into_bytes().to_vec(),
@@ -139,6 +173,43 @@ pub fn canonical_payload(ml_dsa_pk: &[u8], slh_dsa_pk: &[u8]) -> Vec<u8> {
     v.extend_from_slice(&u32::try_from(slh_dsa_pk.len()).expect("pk len fits u32").to_be_bytes());
     v.extend_from_slice(slh_dsa_pk);
     v
+}
+
+/// The canonical payload that also commits to the subkey set:
+/// [`canonical_payload`] followed by a length-prefixed `subkey_merkle_root`
+/// and the big-endian `subkey_count`.
+///
+/// This is what the enclave dual-signs and hashes into the NSM `user_data`, so
+/// the hardware attestation, the OTS anchor, and the PQ signatures all commit to
+/// the two root public keys *and* the bounded subkey set in one shot. Binding the
+/// count (not just the root) makes the attested size of the bounded set
+/// tamper-evident: it cannot be edited on a valid bundle without breaking both
+/// the dual signature and the `user_data` commitment.
+///
+/// # Panics
+/// Panics if `subkey_merkle_root` is longer than `u32::MAX` (never the case: 32 bytes).
+#[must_use]
+pub fn canonical_payload_with_subkeys(
+    ml_dsa_pk: &[u8],
+    slh_dsa_pk: &[u8],
+    subkey_merkle_root: &[u8],
+    subkey_count: u32,
+) -> Vec<u8> {
+    let mut v = canonical_payload(ml_dsa_pk, slh_dsa_pk);
+    v.extend_from_slice(
+        &u32::try_from(subkey_merkle_root.len()).expect("root len fits u32").to_be_bytes(),
+    );
+    v.extend_from_slice(subkey_merkle_root);
+    v.extend_from_slice(&subkey_count.to_be_bytes());
+    v
+}
+
+/// Domain-separated 32-byte sub-seed: `SHA-256(domain || seed)`.
+fn derive_subseed(domain: &[u8], seed: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(domain);
+    h.update(seed);
+    h.finalize().into()
 }
 
 /// The bytes to embed in the NSM `user_data` field: the version prefix followed
@@ -207,6 +278,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn from_seed_is_deterministic() {
+        let seed = [0x42u8; 32];
+        let a = PqRootKeypair::from_seed(&seed);
+        let b = PqRootKeypair::from_seed(&seed);
+        assert_eq!(a.ml_dsa_pk(), b.ml_dsa_pk());
+        assert_eq!(a.slh_dsa_pk(), b.slh_dsa_pk());
+
+        // A different seed yields different keys.
+        let c = PqRootKeypair::from_seed(&[0x43u8; 32]);
+        assert_ne!(a.ml_dsa_pk(), c.ml_dsa_pk());
+        assert_ne!(a.slh_dsa_pk(), c.slh_dsa_pk());
+    }
+
+    #[test]
+    fn from_seed_keys_sign_and_verify() {
+        let kp = PqRootKeypair::from_seed(&[7u8; 32]);
+        let payload = canonical_payload(&kp.ml_dsa_pk(), &kp.slh_dsa_pk());
+        let sig = kp.sign_payload(&payload);
+        verify_dual(&kp.ml_dsa_pk(), &kp.slh_dsa_pk(), &payload, &sig).expect("must verify");
+    }
+
+    #[test]
     fn dual_sign_round_trips() {
         let kp = PqRootKeypair::generate();
         let payload = canonical_payload(&kp.ml_dsa_pk(), &kp.slh_dsa_pk());
@@ -248,5 +341,29 @@ mod tests {
         assert!(ud.len() <= 512);
         assert!(ud.starts_with(USER_DATA_PREFIX));
         assert_eq!(ud.len(), USER_DATA_PREFIX.len() + 32);
+    }
+
+    #[test]
+    fn payload_with_subkeys_extends_root_payload() {
+        let root = [0x55u8; 32];
+        let base = canonical_payload(b"ml", b"slh");
+        let full = canonical_payload_with_subkeys(b"ml", b"slh", &root, 4);
+        assert!(full.starts_with(&base), "must extend the root-only payload");
+        assert!(full.len() > base.len());
+    }
+
+    #[test]
+    fn payload_with_subkeys_binds_the_root() {
+        let a = canonical_payload_with_subkeys(b"ml", b"slh", &[1u8; 32], 4);
+        let b = canonical_payload_with_subkeys(b"ml", b"slh", &[2u8; 32], 4);
+        assert_ne!(a, b, "different Merkle roots must give different payloads");
+    }
+
+    #[test]
+    fn payload_with_subkeys_binds_the_count() {
+        let root = [0x55u8; 32];
+        let a = canonical_payload_with_subkeys(b"ml", b"slh", &root, 4);
+        let b = canonical_payload_with_subkeys(b"ml", b"slh", &root, 5);
+        assert_ne!(a, b, "different subkey counts must give different payloads");
     }
 }

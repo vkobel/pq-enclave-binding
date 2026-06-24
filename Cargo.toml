@@ -8,6 +8,9 @@ members = [
     "crates/pq-quote",
     "crates/pq-cli",
     "crates/pq-ceremony",
+    "crates/pq-subkey",
+    "crates/pq-derive",
+    "crates/pq-merkle",
 ]
 
 [workspace.package]
@@ -22,6 +25,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 anyhow = "1"
+rand_chacha = "0.3"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

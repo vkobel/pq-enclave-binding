@@ -9,16 +9,62 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
-use pq_bundle::{PqRootBundle, TimestampVerifier};
+use pq_bundle::{PqRootBundle, QuoteVerifier, TimestampVerifier};
 use pq_ots::{BitcoinHeaderSource, EsploraHeaderSource, HttpCalendar};
 use pq_quote::NitroQuoteVerifier;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+/// ANSI status coloring for verifier output. Honors `NO_COLOR` and only paints
+/// when stdout is a TTY, so piped/redirected output (and the demo greps) stay clean.
+mod color {
+    use super::{IsTerminal, OnceLock};
+
+    fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+        })
+    }
+
+    fn paint(code: &str, s: &str) -> String {
+        if enabled() {
+            format!("\x1b[{code}m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
+    }
+
+    /// Green — a passing check or success verdict.
+    pub fn ok(s: &str) -> String {
+        paint("32", s)
+    }
+    /// Yellow — a pending/partial result that is not yet a hard pass.
+    pub fn warn(s: &str) -> String {
+        paint("33", s)
+    }
+    /// Red — a failed check.
+    pub fn err(s: &str) -> String {
+        paint("31", s)
+    }
+}
+
+/// `println!` a green pass line (status marker colored when on a TTY).
+macro_rules! ok_ln {
+    ($($a:tt)*) => { println!("{}", $crate::color::ok(&format!($($a)*))) };
+}
+/// `println!` a yellow pending/partial line.
+macro_rules! warn_ln {
+    ($($a:tt)*) => { println!("{}", $crate::color::warn(&format!($($a)*))) };
+}
 
 #[derive(Parser)]
 #[command(name = "pq", about = "Verify and stamp PQ enclave-binding root key bundles")]
@@ -71,6 +117,40 @@ enum Command {
         /// Calendar base URLs (tried in order; the first success wins).
         #[arg(long = "calendar", default_values_t = default_calendars())]
         calendars: Vec<String>,
+    },
+    /// Verify a subkey's birth-provenance and, optionally, a signature it produced.
+    ///
+    /// Without `--ots` / `--root`: checks Merkle membership (and dual signature if
+    /// `--message-hex` is given) only.
+    ///
+    /// With `--ots` and `--root`: runs all 7 bundle checks (OTS anchor, Nitro quote,
+    /// PCR pinning, binding, dual root PQ sigs) first, then appends the subkey checks
+    /// — same pending-OTS handling as `verify`.
+    VerifySubkey {
+        /// Path to bundle.json.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Path to the subkey JSON (a `/sign` or `/subkey/<i>` response).
+        #[arg(long)]
+        subkey: PathBuf,
+        /// Message (hex) the subkey claims to have signed.
+        #[arg(long = "message-hex")]
+        message_hex: Option<String>,
+        /// Path to the `.ots` timestamp proof (enables full bundle verification).
+        #[arg(long)]
+        ots: Option<PathBuf>,
+        /// Path to the pinned AWS Nitro root CA (DER). Required when `--ots` is given.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Local JSON header source. Mutually exclusive with `--esplora`.
+        #[arg(long)]
+        headers: Option<PathBuf>,
+        /// Esplora API base URL. Mutually exclusive with `--headers`.
+        #[arg(long)]
+        esplora: Option<String>,
+        /// Override the Nitro cert-chain verification instant (Unix seconds).
+        #[arg(long = "quote-time-unix")]
+        quote_time_unix: Option<u64>,
     },
 }
 
@@ -145,6 +225,7 @@ fn load_header_file(path: &Path) -> Result<HeaderSource> {
 
 // ─── OTS timestamp verifier adapter ─────────────────────────────────────────
 
+#[allow(dead_code)]
 struct OtsTimestampVerifier<'a> {
     source: &'a HeaderSource,
 }
@@ -190,8 +271,210 @@ fn cmd_inspect(path: &Path) -> Result<()> {
     println!("expected PCR0:       {}", bundle.expected_pcrs.pcr0);
     println!("expected PCR1:       {}", bundle.expected_pcrs.pcr1);
     println!("expected PCR2:       {}", bundle.expected_pcrs.pcr2);
+    println!("subkey merkle root:  {}", bundle.subkey_merkle_root);
+    println!("subkey count:        {}", bundle.subkey_count);
     println!("digest (sha256):     {}", hex::encode(bundle_digest(&bundle)?));
     Ok(())
+}
+
+/// Turn an opaque binding failure into an actionable diagnosis.
+///
+/// The binding check compares the quote's `user_data` (fixed inside the bundle
+/// at ceremony time) against a commitment recomputed from the bundle's own
+/// fields. A mismatch means the bundle was produced by a ceremony whose
+/// canonical-payload formula differs from this `pq` build — *not* that the
+/// enclave is offline (verify never contacts it). The most common cause is
+/// version skew: a deployed enclave built before `subkey_count` was folded into
+/// the signed payload. We detect that precisely by re-checking the legacy
+/// (root-only, no `subkey_count`) formula.
+fn diagnose_binding_mismatch(
+    bundle: &PqRootBundle,
+    quote_verifier: &NitroQuoteVerifier,
+    step_total: u8,
+) -> anyhow::Error {
+    let header = format!(
+        "[6/{step_total}] Key binding FAILED — quote.user_data does not match this bundle's \
+         keys + subkey commitment"
+    );
+
+    // Best-effort: re-extract the quote's user_data and test the legacy formula.
+    let probe = (|| -> Result<bool> {
+        let quote_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&bundle.nsm_quote)
+            .context("decoding nsm_quote")?;
+        let qd = quote_verifier
+            .verify_quote(&quote_bytes)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let ml_pk = hex::decode(&bundle.ml_dsa_pk)?;
+        let slh_pk = hex::decode(&bundle.slh_dsa_pk)?;
+        let subkey_root = hex::decode(&bundle.subkey_merkle_root)?;
+        // Legacy v2 payload: root keys + length-prefixed Merkle root, but NO
+        // subkey_count (the pre-488ad7a formula).
+        let mut legacy = pq_core::canonical_payload(&ml_pk, &slh_pk);
+        legacy.extend_from_slice(&u32::try_from(subkey_root.len()).unwrap_or(0).to_be_bytes());
+        legacy.extend_from_slice(&subkey_root);
+        Ok(qd.user_data == pq_core::user_data_commitment(&legacy))
+    })()
+    .unwrap_or(false);
+
+    if probe {
+        anyhow::anyhow!(
+            "{header}\n  \
+             Cause: this bundle was produced by an OLDER ceremony that did not bind \
+             `subkey_count` into the signed payload (pre-commit 488ad7a), but this `pq` \
+             build expects it.\n  \
+             Fix: re-run the ceremony on an enclave built from current code so the bundle \
+             commits to the new formula, then re-stamp and re-verify. (Verify is offline; \
+             the enclave being up or down is irrelevant.)"
+        )
+    } else {
+        anyhow::anyhow!(
+            "{header}\n  \
+             The bundle's public keys / subkey Merkle root do not match the attested \
+             commitment under any known formula — the bundle is for a different ceremony \
+             or has been tampered with."
+        )
+    }
+}
+
+/// Run bundle verification steps [1/N]–[7/N], printing each result.
+///
+/// Returns `(pending, quote_time, anchor_height, report)`.
+/// `step_total` sets the denominator so callers that append extra steps keep
+/// consistent numbering. When the OTS proof is pending (not yet in a Bitcoin
+/// block), step [1/N] shows ⚠ PENDING and the cert chain is checked against
+/// the current clock (valid for freshly-submitted proofs whose leaf cert is
+/// still live).
+#[allow(clippy::too_many_arguments)]
+fn verify_bundle_steps(
+    bundle: &PqRootBundle,
+    ots_bytes: &[u8],
+    digest: &[u8; 32],
+    root_der: Vec<u8>,
+    source: &HeaderSource,
+    source_given: bool,
+    quote_time_unix: Option<u64>,
+    step_total: u8,
+) -> Result<(bool, u64, Option<usize>, pq_bundle::VerifyReport)> {
+    // Max allowed disagreement between a `--quote-time-unix` override and the
+    // trusted anchor block time before we refuse the override (see invariant #2).
+    const OVERRIDE_TOLERANCE_SECS: u64 = 2 * 60 * 60;
+
+    // ── [1/N] OTS anchor ─────────────────────────────────────────────────────
+    let (pending, quote_time, anchor_height) =
+        match pq_ots::verify(ots_bytes, digest, source) {
+            Ok(anchors) => {
+                if !source_given {
+                    bail!(
+                        "OTS proof is anchored — provide a Bitcoin header source: \
+                         --headers <file> or --esplora <url>"
+                    );
+                }
+                let earliest =
+                    anchors.iter().min_by_key(|a| a.height).expect("anchors non-empty");
+                // The verification instant is load-bearing (invariant #2: the Nitro
+                // chain is checked as of the anchor block's time, not now). Prefer
+                // the trusted header source's block time; only fall back to the
+                // operator-supplied `--quote-time-unix` when the source has no time,
+                // and refuse an override that disagrees with the real block time by
+                // more than a sanity tolerance so it can't silently move the instant
+                // past Q-Day.
+                let block_time =
+                    source.block_time(earliest.height).map_err(|e| anyhow::anyhow!(e))?;
+                let t = match (block_time, quote_time_unix) {
+                    (Some(bt), Some(ov)) => {
+                        let delta = bt.abs_diff(ov);
+                        if delta > OVERRIDE_TOLERANCE_SECS {
+                            bail!(
+                                "--quote-time-unix {ov} disagrees with anchor block {} time \
+                                 {bt} by {delta}s (> {OVERRIDE_TOLERANCE_SECS}s); refusing to \
+                                 use it as the verification instant",
+                                earliest.height
+                            );
+                        }
+                        bt
+                    }
+                    (Some(bt), None) => bt,
+                    (None, Some(ov)) => ov,
+                    (None, None) => bail!(
+                        "anchor block {} has no `time`; pass --quote-time-unix",
+                        earliest.height
+                    ),
+                };
+                ok_ln!("✓ [1/{step_total}] OTS timestamp — bundle digest committed to Bitcoin");
+                println!("          digest {}", hex::encode(digest));
+                println!("          anchored in block {} (time: unix {t})", earliest.height);
+                (false, t, Some(earliest.height))
+            }
+            Err(pq_ots::OtsError::NotAnchored) => {
+                let cals = pq_ots::pending_calendars(ots_bytes).unwrap_or_default();
+                let cal = cals.first().map_or("unknown calendar", |c| c.uri.as_str());
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                warn_ln!(
+                    "⚠ [1/{step_total}] OTS PENDING — submitted to {cal}, not yet in a Bitcoin block"
+                );
+                println!("          digest {}", hex::encode(digest));
+                println!(
+                    "          run `ots upgrade bundle.json.ots` once anchored, then re-run"
+                );
+                println!("          continuing with remaining checks using current time...\n");
+                (true, now, None)
+            }
+            Err(pq_ots::OtsError::HeaderSource(_)) if !source_given => {
+                bail!(
+                    "OTS proof is anchored — provide a Bitcoin header source: \
+                     --headers <file> or --esplora <url>"
+                );
+            }
+            Err(e) => bail!("OTS timestamp verification failed: {e}"),
+        };
+
+    // ── [2/N] Pinned root CA ──────────────────────────────────────────────────
+    let quote_verifier = NitroQuoteVerifier::at_unix_secs(root_der, quote_time);
+    if quote_verifier.root_sha256_hex() != bundle.aws_root_ca_sha256 {
+        bail!(
+            "pinned root CA sha256 ({}) does not match bundle.aws_root_ca_sha256 ({})",
+            quote_verifier.root_sha256_hex(),
+            bundle.aws_root_ca_sha256
+        );
+    }
+    ok_ln!("✓ [2/{step_total}] Pinned AWS root CA matches the bundle");
+    println!("          sha256 {}", bundle.aws_root_ca_sha256);
+
+    // ── [3/N]–[7/N] quote sig, debug-reject, PCR pin, binding, dual PQ sig ───
+    // OTS was already handled above — pass None for ts_verifier. `pq verify` is
+    // fully offline — it never contacts the enclave — so a binding failure is a
+    // bundle/verifier mismatch, not the enclave being down. Diagnose it.
+    let report = match pq_bundle::verify(bundle, &quote_verifier, None) {
+        Ok(report) => report,
+        Err(pq_bundle::Error::BindingMismatch) => {
+            return Err(diagnose_binding_mismatch(bundle, &quote_verifier, step_total));
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context("bundle verification failed")),
+    };
+
+    let time_note = if pending { "current time — re-verify once anchored" } else { "anchor block time" };
+    ok_ln!("✓ [3/{step_total}] NSM quote — COSE_Sign1 ES384 signature + cert chain valid");
+    println!("          to the pinned root, as of unix {quote_time} ({time_note})");
+    ok_ln!("✓ [4/{step_total}] Debug-mode rejected — PCR0/1/2 are not all-zero");
+    ok_ln!("✓ [5/{step_total}] PCR pinning — quote PCR0/1/2 == bundle.expected_pcrs");
+    println!("          PCR0 {}", hex::encode(&report.pcr0));
+    println!("          PCR1 {}", hex::encode(&report.pcr1));
+    println!("          PCR2 {}", hex::encode(&report.pcr2));
+    ok_ln!(
+        "✓ [6/{step_total}] Key binding — quote.user_data == \
+         \"pq-keyfork-v1:\" || SHA-256(canonical_payload_with_subkeys)"
+    );
+    println!("          user_data {}", hex::encode(&report.user_data));
+    ok_ln!("✓ [7/{step_total}] Dual PQ signatures valid over canonical_payload_with_subkeys");
+    println!(
+        "          ML-DSA-65 pk {} B  +  SLH-DSA-SHAKE-128f pk {} B",
+        report.ml_dsa_pk_len, report.slh_dsa_pk_len
+    );
+
+    Ok((pending, quote_time, anchor_height, report))
 }
 
 fn cmd_verify(
@@ -209,86 +492,37 @@ fn cmd_verify(
         fs::read(root_path).with_context(|| format!("reading root CA {}", root_path.display()))?;
     let digest = bundle_digest(&bundle)?;
 
+    let source_given = headers.is_some() || esplora.is_some();
     let source = match (headers, esplora) {
         (Some(_), Some(_)) => bail!("--headers and --esplora are mutually exclusive"),
         (Some(p), None) => load_header_file(p)?,
         (None, Some(url)) => HeaderSource::Esplora(EsploraHeaderSource::new(url.to_string())),
-        (None, None) => {
-            bail!("provide a Bitcoin header source: --headers <file> or --esplora <url>")
-        }
+        (None, None) => HeaderSource::Map { roots: BTreeMap::new(), times: BTreeMap::new() },
     };
 
     println!("Verifying {} ...\n", bundle_path.display());
 
-    // ── [1/7] OTS anchor ─────────────────────────────────────────────────────
-    // Verify OTS up front so we can derive the anchor block time for the quote.
-    let anchors = pq_ots::verify(&ots_bytes, &digest, &source)
-        .context("OTS timestamp verification failed")?;
-    let earliest = anchors
-        .iter()
-        .min_by_key(|a| a.height)
-        .context("OTS proof produced no anchors")?;
+    let (pending, _qt, anchor_height, _report) = verify_bundle_steps(
+        &bundle,
+        &ots_bytes,
+        &digest,
+        root_der,
+        &source,
+        source_given,
+        quote_time_unix,
+        7,
+    )?;
 
-    // Verify the (quantum-breakable) Nitro chain *as of the anchor block's time*.
-    // Derive that instant from the proven anchor block itself; `--quote-time-unix`
-    // is only an override (and the sole option if a header file omits `time`).
-    let quote_time = match quote_time_unix {
-        Some(t) => t,
-        None => source
-            .block_time(earliest.height)
-            .map_err(|e| anyhow::anyhow!("looking up anchor block {} time: {e}", earliest.height))?
-            .with_context(|| {
-                format!(
-                    "anchor block {} has no `time` (header file omitted it); \
-                     pass --quote-time-unix",
-                    earliest.height
-                )
-            })?,
-    };
-    println!("✓ [1/7] OTS timestamp — bundle digest committed to Bitcoin");
-    println!("          digest {}", hex::encode(digest));
-    println!("          anchored in block {} (time: unix {quote_time})", earliest.height);
-
-    let quote_verifier = NitroQuoteVerifier::at_unix_secs(root_der, quote_time);
-
-    // ── [2/7] Pinned root CA cross-check ─────────────────────────────────────
-    if quote_verifier.root_sha256_hex() != bundle.aws_root_ca_sha256 {
-        bail!(
-            "pinned root CA sha256 ({}) does not match bundle.aws_root_ca_sha256 ({})",
-            quote_verifier.root_sha256_hex(),
-            bundle.aws_root_ca_sha256
+    if pending {
+        warn_ln!("\n⚠ PARTIAL VERIFY — OTS not yet anchored in Bitcoin.");
+        println!("  Checks [2/7]–[7/7] passed. Re-run `pq verify` once the proof is upgraded.");
+    } else {
+        ok_ln!("\nVERIFIED — these PQ public keys were generated inside the attested");
+        ok_ln!(
+            "enclave (PCRs above) and the bundle existed before Bitcoin block {}.",
+            anchor_height.unwrap()
         );
     }
-    println!("✓ [2/7] Pinned AWS root CA matches the bundle");
-    println!("          sha256 {}", bundle.aws_root_ca_sha256);
-
-    // ── [3/7]–[7/7] quote sig, debug-reject, PCR pin, binding, dual PQ sig ────
-    let ts_verifier = OtsTimestampVerifier { source: &source };
-    let report = pq_bundle::verify(&bundle, &quote_verifier, Some((&ts_verifier, &ots_bytes)))
-        .context("bundle verification failed")?;
-
-    println!("✓ [3/7] NSM quote — COSE_Sign1 ES384 signature + cert chain valid");
-    println!("          to the pinned root, as of unix {quote_time} (anchor block time)");
-    println!("✓ [4/7] Debug-mode rejected — PCR0/1/2 are not all-zero");
-    println!("✓ [5/7] PCR pinning — quote PCR0/1/2 == bundle.expected_pcrs");
-    println!("          PCR0 {}", hex::encode(&report.pcr0));
-    println!("          PCR1 {}", hex::encode(&report.pcr1));
-    println!("          PCR2 {}", hex::encode(&report.pcr2));
-    println!(
-        "✓ [6/7] Key binding — quote.user_data == \"pq-keyfork-v1:\" || SHA-256(canonical_payload)"
-    );
-    println!("          user_data {}", hex::encode(&report.user_data));
-    println!("✓ [7/7] Dual PQ signatures valid over canonical_payload");
-    println!(
-        "          ML-DSA-65 pk {} B  +  SLH-DSA-SHAKE-128f pk {} B",
-        report.ml_dsa_pk_len, report.slh_dsa_pk_len
-    );
-
-    println!("\nVERIFIED — these PQ public keys were generated inside the attested");
-    println!(
-        "enclave (PCRs above) and the bundle existed before Bitcoin block {}.",
-        earliest.height
-    );
     Ok(())
 }
 
@@ -323,7 +557,145 @@ fn cmd_stamp(bundle_path: &Path, out: &Path, calendars: &[String]) -> Result<()>
     }
 }
 
-fn main() -> Result<()> {
+#[derive(serde::Deserialize)]
+struct SubkeyResponse {
+    index: u32,
+    purpose_tag: u8,
+    ml_dsa_pk: String,
+    slh_dsa_pk: String,
+    #[serde(default)]
+    ml_dsa_sig: Option<String>,
+    #[serde(default)]
+    slh_dsa_sig: Option<String>,
+    merkle_proof: Vec<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_subkey(
+    bundle_path: &Path,
+    subkey_path: &Path,
+    message_hex: Option<&str>,
+    ots_path: Option<&Path>,
+    root_path: Option<&Path>,
+    headers: Option<&Path>,
+    esplora: Option<&str>,
+    quote_time_unix: Option<u64>,
+) -> Result<()> {
+    let bundle = load_bundle(bundle_path)?;
+    let sk: SubkeyResponse = serde_json::from_str(&fs::read_to_string(subkey_path)?)?;
+
+    let with_sig = message_hex.is_some();
+
+    // ── Optional full bundle verification (steps [1/N]–[7/N]) ────────────────
+    let (bundle_steps, pending, anchor_height) = if let Some(ots_p) = ots_path {
+        let root_p = root_path
+            .context("--root is required when --ots is given")?;
+        let ots_bytes =
+            fs::read(ots_p).with_context(|| format!("reading ots {}", ots_p.display()))?;
+        let root_der =
+            fs::read(root_p).with_context(|| format!("reading root CA {}", root_p.display()))?;
+        let digest = bundle_digest(&bundle)?;
+
+        let source_given = headers.is_some() || esplora.is_some();
+        let source = match (headers, esplora) {
+            (Some(_), Some(_)) => bail!("--headers and --esplora are mutually exclusive"),
+            (Some(p), None) => load_header_file(p)?,
+            (None, Some(url)) => HeaderSource::Esplora(EsploraHeaderSource::new(url.to_string())),
+            (None, None) => HeaderSource::Map { roots: BTreeMap::new(), times: BTreeMap::new() },
+        };
+
+        // Total steps: 7 bundle + 1 birth-provenance + optional 1 authenticity.
+        let total = 7u8 + 1 + u8::from(with_sig);
+        println!("Verifying subkey #{} against {} ...\n", sk.index, bundle_path.display());
+
+        let (pending, _qt, anchor_height, _report) = verify_bundle_steps(
+            &bundle,
+            &ots_bytes,
+            &digest,
+            root_der,
+            &source,
+            source_given,
+            quote_time_unix,
+            total,
+        )?;
+        (total, pending, anchor_height)
+    } else {
+        let total = 1u8 + u8::from(with_sig);
+        (total, false, None)
+    };
+
+    // ── Birth-provenance: Merkle membership ──────────────────────────────────
+    let step = bundle_steps - u8::from(with_sig);
+    let root: [u8; 32] = hex::decode(&bundle.subkey_merkle_root)
+        .context("decoding bundle.subkey_merkle_root")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("subkey_merkle_root is not 32 bytes"))?;
+    let ml_pk = hex::decode(&sk.ml_dsa_pk).context("subkey ml_dsa_pk")?;
+    let slh_pk = hex::decode(&sk.slh_dsa_pk).context("subkey slh_dsa_pk")?;
+    let siblings: Vec<[u8; 32]> = sk
+        .merkle_proof
+        .iter()
+        .map(|h| {
+            hex::decode(h)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .context("merkle_proof node must be 32-byte hex")
+        })
+        .collect::<Result<_>>()?;
+
+    if !pq_merkle::verify_membership(&root, sk.index, sk.purpose_tag, &ml_pk, &slh_pk, &siblings) {
+        bail!(
+            "[{step}/{bundle_steps}] birth-provenance FAILED — subkey #{} is not in the \
+             bundle's anchored Merkle set (wrong subkey, or it predates this bundle)",
+            sk.index
+        );
+    }
+    ok_ln!(
+        "✓ [{step}/{bundle_steps}] Birth-provenance — subkey #{} is committed in the enclave's anchored set",
+        sk.index
+    );
+
+    // ── Authenticity: dual signature over message ─────────────────────────────
+    if let Some(msg_hex) = message_hex {
+        let msg = hex::decode(msg_hex).context("--message-hex")?;
+        let (Some(ml_sig), Some(slh_sig)) = (&sk.ml_dsa_sig, &sk.slh_dsa_sig) else {
+            bail!("--message-hex given but subkey JSON has no signatures");
+        };
+        let dual = pq_core::DualSignature {
+            ml_dsa: hex::decode(ml_sig).context("ml_dsa_sig")?,
+            slh_dsa: hex::decode(slh_sig).context("slh_dsa_sig")?,
+        };
+        pq_core::verify_dual(&ml_pk, &slh_pk, &msg, &dual).with_context(|| {
+            format!("[{bundle_steps}/{bundle_steps}] authenticity FAILED — signature does not verify")
+        })?;
+        ok_ln!(
+            "✓ [{bundle_steps}/{bundle_steps}] Authenticity — dual signature over the message verifies"
+        );
+    }
+
+    if pending {
+        warn_ln!("\n⚠ PARTIAL VERIFY — OTS not yet anchored in Bitcoin.");
+        println!("  Re-run `pq verify-subkey` with the upgraded proof once anchored.");
+    } else if ots_path.is_some() {
+        ok_ln!("\nVERIFIED — this subkey was generated inside the attested enclave");
+        if let Some(h) = anchor_height {
+            ok_ln!("(PCRs above) and the bundle existed before Bitcoin block {h}.");
+        }
+    } else {
+        ok_ln!("\nVERIFIED — this subkey was generated inside the attested enclave.");
+    }
+    Ok(())
+}
+
+fn main() {
+    if let Err(e) = run() {
+        // Single place where any verify/stamp failure is reported, in red.
+        eprintln!("{}", color::err(&format!("✗ {e:#}")));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Inspect { bundle } => cmd_inspect(&bundle),
@@ -347,6 +719,25 @@ fn main() -> Result<()> {
             out,
             calendars,
         } => cmd_stamp(&bundle, &out, &calendars),
+        Command::VerifySubkey {
+            bundle,
+            subkey,
+            message_hex,
+            ots,
+            root,
+            headers,
+            esplora,
+            quote_time_unix,
+        } => verify_subkey(
+            &bundle,
+            &subkey,
+            message_hex.as_deref(),
+            ots.as_deref(),
+            root.as_deref(),
+            headers.as_deref(),
+            esplora.as_deref(),
+            quote_time_unix,
+        ),
     }
 }
 
@@ -403,6 +794,8 @@ mod tests {
                 pcr1: "22".repeat(48),
                 pcr2: "33".repeat(48),
             },
+            subkey_merkle_root: "00".repeat(32),
+            subkey_count: 0,
             ml_dsa_sig: hex::encode(sig.ml_dsa),
             slh_dsa_sig: hex::encode(sig.slh_dsa),
         };

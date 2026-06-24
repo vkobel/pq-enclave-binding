@@ -1,19 +1,17 @@
 [package]
-name = "pq-bundle"
+name = "pq-subkey"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "PQ root key bundle serialization and verification for the PQ enclave-binding demo."
+description = "Root-certified post-quantum subkey delegation (Approach A) for the PQ enclave-binding demo."
 
 [dependencies]
 pq-core = { path = "../pq-core" }
-pq-merkle = { path = "../pq-merkle" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
-base64 = { workspace = true }
 
 [lints]
 workspace = true

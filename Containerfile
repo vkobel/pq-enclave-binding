@@ -21,6 +21,7 @@ ENV RUSTFLAGS="-C codegen-units=1 -C target-feature=+crt-static -C strip=symbols
 
 # Workspace manifest + lockfile first so the dependency set is pinned.
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo ./.cargo
 COPY crates ./crates
 
 # Network-allowed fetch layer; everything after is hermetic.
