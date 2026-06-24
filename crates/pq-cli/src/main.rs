@@ -251,6 +251,10 @@ fn verify_bundle_steps(
     quote_time_unix: Option<u64>,
     step_total: u8,
 ) -> Result<(bool, u64, Option<usize>, pq_bundle::VerifyReport)> {
+    // Max allowed disagreement between a `--quote-time-unix` override and the
+    // trusted anchor block time before we refuse the override (see invariant #2).
+    const OVERRIDE_TOLERANCE_SECS: u64 = 2 * 60 * 60;
+
     // ── [1/N] OTS anchor ─────────────────────────────────────────────────────
     let (pending, quote_time, anchor_height) =
         match pq_ots::verify(ots_bytes, digest, source) {
@@ -263,17 +267,34 @@ fn verify_bundle_steps(
                 }
                 let earliest =
                     anchors.iter().min_by_key(|a| a.height).expect("anchors non-empty");
-                let t = match quote_time_unix {
-                    Some(t) => t,
-                    None => source
-                        .block_time(earliest.height)
-                        .map_err(|e| anyhow::anyhow!(e))?
-                        .with_context(|| {
-                            format!(
-                                "anchor block {} has no `time`; pass --quote-time-unix",
+                // The verification instant is load-bearing (invariant #2: the Nitro
+                // chain is checked as of the anchor block's time, not now). Prefer
+                // the trusted header source's block time; only fall back to the
+                // operator-supplied `--quote-time-unix` when the source has no time,
+                // and refuse an override that disagrees with the real block time by
+                // more than a sanity tolerance so it can't silently move the instant
+                // past Q-Day.
+                let block_time =
+                    source.block_time(earliest.height).map_err(|e| anyhow::anyhow!(e))?;
+                let t = match (block_time, quote_time_unix) {
+                    (Some(bt), Some(ov)) => {
+                        let delta = bt.abs_diff(ov);
+                        if delta > OVERRIDE_TOLERANCE_SECS {
+                            bail!(
+                                "--quote-time-unix {ov} disagrees with anchor block {} time \
+                                 {bt} by {delta}s (> {OVERRIDE_TOLERANCE_SECS}s); refusing to \
+                                 use it as the verification instant",
                                 earliest.height
-                            )
-                        })?,
+                            );
+                        }
+                        bt
+                    }
+                    (Some(bt), None) => bt,
+                    (None, Some(ov)) => ov,
+                    (None, None) => bail!(
+                        "anchor block {} has no `time`; pass --quote-time-unix",
+                        earliest.height
+                    ),
                 };
                 println!("✓ [1/{step_total}] OTS timestamp — bundle digest committed to Bitcoin");
                 println!("          digest {}", hex::encode(digest));

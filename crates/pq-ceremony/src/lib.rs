@@ -148,8 +148,8 @@ pub fn run_ceremony(
     }
     let subkey_root = pq_merkle::merkle_root(&leaves);
 
-    // Commit root keys + subkey set in one payload.
-    let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root);
+    // Commit root keys + subkey set (root and count) in one payload.
+    let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, global_index);
     let sig = root.sign_payload(&payload);
     let quote = attest_bundle_payload(nsm, &payload)?;
 
@@ -201,7 +201,7 @@ mod tests {
         let ml_pk = hex::decode(&b.ml_dsa_pk).unwrap();
         let slh_pk = hex::decode(&b.slh_dsa_pk).unwrap();
         let root = hex::decode(&b.subkey_merkle_root).unwrap();
-        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &root);
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &root, b.subkey_count);
         let dual = DualSignature {
             ml_dsa: hex::decode(&b.ml_dsa_sig).unwrap(),
             slh_dsa: hex::decode(&b.slh_dsa_sig).unwrap(),

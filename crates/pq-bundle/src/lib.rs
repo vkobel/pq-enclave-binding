@@ -304,8 +304,8 @@ pub fn verify(
         source: e,
     })?;
 
-    // ── Step 4: Binding check (root keys + subkey set) ───────────────────────
-    let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root);
+    // ── Step 4: Binding check (root keys + subkey set: root and count) ───────
+    let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, bundle.subkey_count);
     let expected_user_data = user_data_commitment(&payload);
     if quote_data.user_data != expected_user_data {
         return Err(Error::BindingMismatch);
@@ -395,7 +395,7 @@ mod tests {
         let leaf = pq_merkle::subkey_leaf(0, 1, &ml_pk, &slh_pk);
         let subkey_root = pq_merkle::merkle_root(&[leaf]);
 
-        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root);
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, 1);
         let sig = kp.sign_payload(&payload);
 
         let pcr0 = sample_pcr(0x11);
@@ -431,7 +431,7 @@ mod tests {
         let ml_pk = hex::decode(&bundle.ml_dsa_pk).unwrap();
         let slh_pk = hex::decode(&bundle.slh_dsa_pk).unwrap();
         let subkey_root = hex::decode(&bundle.subkey_merkle_root).unwrap();
-        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root);
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, bundle.subkey_count);
         let user_data = user_data_commitment(&payload);
 
         let verifier = MockQuoteVerifier::good(pcr0, pcr1, pcr2, user_data);
@@ -446,7 +446,7 @@ mod tests {
         let ml_pk = hex::decode(&bundle.ml_dsa_pk).unwrap();
         let slh_pk = hex::decode(&bundle.slh_dsa_pk).unwrap();
         let subkey_root = hex::decode(&bundle.subkey_merkle_root).unwrap();
-        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root);
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, bundle.subkey_count);
         let user_data = user_data_commitment(&payload);
 
         let verifier =
@@ -465,7 +465,7 @@ mod tests {
         let ml_pk = hex::decode(&bundle.ml_dsa_pk).unwrap();
         let slh_pk = hex::decode(&bundle.slh_dsa_pk).unwrap();
         let subkey_root = hex::decode(&bundle.subkey_merkle_root).unwrap();
-        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root);
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, bundle.subkey_count);
         let user_data = user_data_commitment(&payload);
 
         // Provide a wrong PCR2
@@ -505,7 +505,7 @@ mod tests {
         let ml_pk = hex::decode(&bundle.ml_dsa_pk).unwrap();
         let slh_pk = hex::decode(&bundle.slh_dsa_pk).unwrap();
         let subkey_root = hex::decode(&bundle.subkey_merkle_root).unwrap();
-        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root);
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, bundle.subkey_count);
         let user_data = user_data_commitment(&payload);
 
         let verifier = MockQuoteVerifier::good(pcr0, pcr1, pcr2, user_data);
@@ -556,8 +556,26 @@ mod tests {
         let slh_pk = hex::decode(&bundle.slh_dsa_pk).unwrap();
         // user_data still commits to the *original* root, so binding fails.
         let original_root = pq_merkle::merkle_root(&[pq_merkle::subkey_leaf(0, 1, &ml_pk, &slh_pk)]);
-        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &original_root);
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &original_root, bundle.subkey_count);
         let user_data = user_data_commitment(&payload);
+
+        let verifier = MockQuoteVerifier::good(pcr0, pcr1, pcr2, user_data);
+        let err = verify(&bundle, &verifier, None).unwrap_err();
+        assert!(matches!(err, Error::BindingMismatch), "expected BindingMismatch, got: {err}");
+    }
+
+    #[test]
+    fn tampered_subkey_count_rejected() {
+        let (mut bundle, pcr0, pcr1, pcr2) = make_valid_bundle();
+
+        // user_data commits to the original count (1); bump it without re-signing.
+        let ml_pk = hex::decode(&bundle.ml_dsa_pk).unwrap();
+        let slh_pk = hex::decode(&bundle.slh_dsa_pk).unwrap();
+        let subkey_root = hex::decode(&bundle.subkey_merkle_root).unwrap();
+        let payload = canonical_payload_with_subkeys(&ml_pk, &slh_pk, &subkey_root, 1);
+        let user_data = user_data_commitment(&payload);
+
+        bundle.subkey_count = 99;
 
         let verifier = MockQuoteVerifier::good(pcr0, pcr1, pcr2, user_data);
         let err = verify(&bundle, &verifier, None).unwrap_err();
