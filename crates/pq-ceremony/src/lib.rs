@@ -4,8 +4,8 @@
 //! [`run_ceremony`] performs the one-shot flow from the demo spec:
 //!
 //! 1. Generate a mnemonic from in-enclave entropy and HD-derive the root keypair
-//!    at `m/0'/0'` plus N subkeys across Auth (account 1) and Encryption
-//!    (account 2) lanes.
+//!    at `m/0'/0'` plus N subkeys across Auth (account 1, `m/1'/0'`…`m/1'/<N-1>'`)
+//!    and Encryption (account 2, `m/2'/0'`…`m/2'/<M-1>'`) lanes.
 //! 2. Build a Merkle tree over the subkeys and fold the root into the payload.
 //! 3. Dual-sign the payload (`canonical_payload_with_subkeys`) with the root key.
 //! 4. Request an NSM attestation document whose `user_data` commits to that

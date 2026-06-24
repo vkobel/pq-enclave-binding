@@ -9,9 +9,10 @@
 //! Endpoints:
 //! * `GET /bundle.json`   — the finished bundle (JSON).
 //! * `GET /health`, `GET /` — liveness probe (`ok`).
-//! * `POST /sign`         — re-derive a subkey, sign in-process, return dual
-//!   signature + Merkle membership proof.
+//! * `GET /subkeys`       — all pre-committed subkeys (public keys + Merkle proofs).
 //! * `GET /subkey/<i>`    — public material + proof for subkey `i`.
+//! * `POST /sign`         — re-derive subkey `i`, dual-sign (ML-DSA-65 **and**
+//!   SLH-DSA-SHAKE-128f) in-process, return both signatures + Merkle proof.
 //!
 //! The real AWS NSM is used only with `--features nitro` (Linux/Nitro). Without
 //! it, a [`MockNsm`] yields a structurally valid but cryptographically fake
@@ -112,6 +113,30 @@ fn sign_response(state: &CeremonyState, body: &str) -> (String, String) {
     ("200 OK".into(), json.to_string())
 }
 
+/// Build the JSON for `GET /subkeys` — all pre-committed subkeys (public material + proofs).
+fn subkeys_list_response(state: &CeremonyState) -> (String, String) {
+    let list: Vec<serde_json::Value> = state
+        .subkeys
+        .iter()
+        .map(|rec| {
+            let proof_hex: Vec<String> = state
+                .proof(rec.global_index)
+                .unwrap_or_default()
+                .iter()
+                .map(hex::encode)
+                .collect();
+            serde_json::json!({
+                "index": rec.global_index,
+                "purpose_tag": rec.purpose_tag,
+                "ml_dsa_pk": hex::encode(&rec.ml_dsa_pk),
+                "slh_dsa_pk": hex::encode(&rec.slh_dsa_pk),
+                "merkle_proof": proof_hex,
+            })
+        })
+        .collect();
+    ("200 OK".into(), serde_json::json!(list).to_string())
+}
+
 /// Build the JSON for `GET /subkey/<i>` (public material + proof, no signature).
 fn subkey_response(state: &CeremonyState, index: u32) -> (String, String) {
     let Some(rec) = state.subkeys.iter().find(|r| r.global_index == index) else {
@@ -187,6 +212,10 @@ fn handle(stream: &mut TcpStream, state: &CeremonyState, bundle_json: &str) -> s
         ("GET", "/health" | "/") => ("200 OK".into(), "text/plain", "ok\n".to_string()),
         ("POST", "/sign") => {
             let (s, b) = sign_response(state, &body);
+            (s, "application/json", b)
+        }
+        ("GET", "/subkeys") => {
+            let (s, b) = subkeys_list_response(state);
             (s, "application/json", b)
         }
         ("GET", p) if p.starts_with("/subkey/") => {
