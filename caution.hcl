@@ -19,6 +19,10 @@ enclave "default" {
   }
 
   unit "default" {
-    command = "PQ_SUBKEYS_AUTH=30 /app/pq-ceremony --bind 0.0.0.0:8080 --root-ca /etc/pq/aws_nitro_root.der"
+    command = "/app/pq-ceremony"
+    args    = ["--bind", "0.0.0.0:8080", "--root-ca", "/etc/pq/aws_nitro_root.der"]
+    env {
+      PQ_SUBKEYS_AUTH = "30"
+    }
   }
 }
